@@ -1,0 +1,122 @@
+import torch
+import copy
+import torch.nn as nn
+import numpy as np
+from tqdm import tqdm
+
+
+class Server:
+    def __init__(self, global_model, val_loader, device):
+        self.global_model = global_model
+        self.val_loader = val_loader
+        self.device = device
+        self.criterion = nn.CrossEntropyLoss()
+
+    def aggregate(self, client_weights_list):
+        """FedAvg: 联邦平均算法"""
+        w_avg = copy.deepcopy(client_weights_list[0])
+
+        for key in w_avg.keys():
+            for i in range(1, len(client_weights_list)):
+                w_avg[key] += client_weights_list[i][key]
+            w_avg[key] = torch.div(w_avg[key], len(client_weights_list))
+
+        self.global_model.load_state_dict(w_avg)
+
+    def evaluate(self):
+        """
+        [普通验证] 只计算 Acc 和 Loss，不收集数据
+        """
+        self.global_model.eval()
+        self.global_model.to(self.device)
+
+        loss_sum = 0.0
+        correct = 0
+        total = 0
+
+        with torch.no_grad():
+            # leave=False 防止每轮进度条刷屏
+            for images, labels in self.val_loader:
+                images, labels = images.to(self.device), labels.to(self.device)
+
+                output = self.global_model(images)
+
+                # 兼容性处理：如果模型返回 (logits, features)，只取 logits
+                if isinstance(output, tuple):
+                    logits = output[0]
+                else:
+                    logits = output
+
+                loss = self.criterion(logits, labels)
+                loss_sum += loss.item()
+
+                _, predicted = torch.max(logits, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+
+        # 防止除零
+        acc = 100 * correct / total if total > 0 else 0
+        avg_loss = loss_sum / len(self.val_loader) if len(self.val_loader) > 0 else 0
+
+        return acc, avg_loss
+
+    def run_final_test(self, model_path, test_loader=None):
+        """
+        [最终测试] 完全复刻 main_central.py 的逻辑
+        :param test_loader: 传入专门的测试集加载器，如果不传则默认用 val_loader
+        """
+        # 1. 加载最佳权重
+        print(f"📥 Server loading best model from: {model_path}")
+        state_dict = torch.load(model_path, map_location=self.device)
+        self.global_model.load_state_dict(state_dict)
+
+        self.global_model.eval()
+        self.global_model.to(self.device)
+
+        # 2. 决定使用哪个数据集 (Test 优先)
+        target_loader = test_loader if test_loader is not None else self.val_loader
+        print(f"🧪 Running Inference on {len(target_loader.dataset)} samples...")
+
+        # 3. 容器
+        all_logits = []
+        all_preds = []
+        all_labels = []
+        all_features = []
+
+        with torch.no_grad():
+            for images, labels in tqdm(target_loader, desc="   📊 Extracting", ncols=100):
+                images = images.to(self.device)
+
+                # --- [逻辑复刻核心区] ---
+                output = self.global_model(images)
+
+                features = None
+                # 判断模型是否返回了特征
+                if isinstance(output, tuple):
+                    logits = output[0]
+                    features = output[1]
+                else:
+                    logits = output
+                    # 如果模型没返回特征，用 logits 充当特征
+                    features = logits
+
+                _, preds = torch.max(logits, 1)
+
+                # 收集基础数据
+                all_logits.append(logits.cpu().numpy())
+                all_preds.append(preds.cpu().numpy())
+                all_labels.append(labels.numpy())
+
+                # 处理特征维度 (参考 main_central.py: if len > 2 then mean)
+                if features is not None:
+                    if len(features.shape) > 2:
+                        features = features.mean(dim=[2, 3])
+                    all_features.append(features.cpu().numpy())
+
+        # 拼接数据
+        logits = np.concatenate(all_logits, axis=0)
+        preds = np.concatenate(all_preds, axis=0)
+        labels = np.concatenate(all_labels, axis=0)
+        features = np.concatenate(all_features, axis=0) if all_features else np.array([])
+
+        return features, labels, preds, logits
