@@ -1,0 +1,11 @@
+# 排除大论文实验生成的中间数据和结果
+base/
+result/
+
+# 排除 PyCharm 自动生成的本地配置文件（千万别传到 Git 上）
+.idea/
+.vs/
+
+# 排除 Python 运行时产生的缓存文件
+__pycache__/
+*.pyc
