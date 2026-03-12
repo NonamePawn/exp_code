@@ -3,7 +3,7 @@ import torch.nn as nn
 import torchvision.models as models
 import timm  # 用于加载 Transformer (ViT) 模型
 import os
-
+import torch.nn.functional as F
 
 # ==========================================
 # 1. 局部纹理流: MedicalNet 2D 重构版本 (内嵌 3D->2D 权重转换)
@@ -22,10 +22,10 @@ class MedicalNet2D_Wrapper(nn.Module):
 
         # 1. 实例化一个标准的 2D ResNet
         if base_model_name == 'resnet50':
-            self.backbone = models.resnet50(pretrained=False)
+            self.backbone = models.resnet50(weights=None)
             feature_dim = 2048
         elif base_model_name == 'resnet18':
-            self.backbone = models.resnet18(pretrained=False)
+            self.backbone = models.resnet18(weights=None)
             feature_dim = 512
         else:
             raise ValueError("不支持的 ResNet 版本，请选择 resnet18 或 resnet50")
@@ -121,30 +121,77 @@ class MedicalNet2D_Wrapper(nn.Module):
 
 class RADDINO_Wrapper(nn.Module):
     """
-    RAD-DINO 适配器
-    大论文要求：提取 CLS Token 作为全局上下文特征。
+    RAD-DINO 适配器 (内嵌权重加载与通道手术功能)
     """
 
-    def __init__(self, in_channels=5):
+    def __init__(self, in_channels=5, pretrained_path=None):
         super().__init__()
-        # 实际实验中如果下载了 RAD-DINO，可以用 torch.load 替换此处的 timm
+        self.in_channels = in_channels
+
+        # 1. 实例化基础空壳 ViT
         self.vit = timm.create_model('vit_base_patch16_224', pretrained=False, num_classes=0)
 
-        # 修改 Patch Embedding 层的输入通道数
+        # 2. 修改 Patch Embedding 层的输入通道数
         original_proj = self.vit.patch_embed.proj
         self.vit.patch_embed.proj = nn.Conv2d(
-            in_channels=in_channels,
+            in_channels=self.in_channels,
             out_channels=original_proj.out_channels,
             kernel_size=original_proj.kernel_size,
             stride=original_proj.stride,
             padding=original_proj.padding
         )
 
+        # 3. 自动加载预训练权重并做“通道手术”
+        if pretrained_path is not None and os.path.exists(pretrained_path):
+            self._load_pretrained_weights(pretrained_path)
+        elif pretrained_path is not None:
+            print(f"[警告] 找不到 RAD-DINO 预训练文件: {pretrained_path}，使用随机初始化。")
+
+    def _load_pretrained_weights(self, pth_path):
+        print(f"====== 开始为 RAD-DINO 加载并转换预训练权重 ======")
+
+        # 【新增逻辑】：判断并读取 safetensors 格式
+        if pth_path.endswith('.safetensors'):
+            from safetensors.torch import load_file
+            checkpoint = load_file(pth_path)
+            state_dict_pretrained = checkpoint
+        else:
+            checkpoint = torch.load(pth_path, map_location='cpu')
+            state_dict_pretrained = checkpoint.get('state_dict', checkpoint.get('model', checkpoint))
+
+        model_state_dict = self.vit.state_dict()
+        new_state_dict = {}
+        loaded_layers = 0
+
+        for key in model_state_dict.keys():
+            # HuggingFace 的权重可能带有不同前缀，RAD-DINO 通常匹配 timm 的 keys
+            if key in state_dict_pretrained:
+                weight = state_dict_pretrained[key]
+
+                # --- 核心手术：处理 patch_embed 的通道冲突 ---
+                if 'patch_embed.proj.weight' in key and weight.shape[1] != self.in_channels:
+                    print(f"    -> 正在对齐 {key} 的输入通道: {weight.shape[1]} -> {self.in_channels}")
+                    # 取预训练通道的均值，然后复制成 in_channels (5) 份
+                    mean_weight = weight.mean(dim=1, keepdim=True)
+                    weight = mean_weight.repeat(1, self.in_channels, 1, 1)
+
+                if weight.shape == model_state_dict[key].shape:
+                    new_state_dict[key] = weight
+                    loaded_layers += 1
+            else:
+                new_state_dict[key] = model_state_dict[key]
+
+        self.vit.load_state_dict(new_state_dict, strict=False)
+        print(f"====== RAD-DINO 权重装载完成！共转换 {loaded_layers} 个张量 ======")
+        
     def forward(self, x):
-        x = self.vit.patch_embed(x)
-        x = self.vit._pos_embed(x)
-        x = self.vit.norm_pre(x)
-        tokens = self.vit.blocks(x)
+        # 专门为 ViT 缩放尺寸到 224x224
+        x_resized = F.interpolate(x, size=(224, 224), mode='bilinear', align_corners=False)
+
+        x_tokens = self.vit.patch_embed(x_resized)
+        x_tokens = self.vit._pos_embed(x_tokens)
+        x_tokens = self.vit.norm_pre(x_tokens)
+        tokens = self.vit.blocks(x_tokens)
         tokens = self.vit.norm(tokens)
 
         cls_token = tokens[:, 0, :]  # (B, 768)
@@ -161,21 +208,24 @@ class DHFEM(nn.Module):
     双流异构特征提取模块
     """
 
-    def __init__(self, in_channels=5, use_local_stream=True, use_global_stream=True, medicalnet_pretrained_path=None):
+    def __init__(self, in_channels=5, use_local_stream=True, use_global_stream=True,
+                 medicalnet_pretrained_path=None, raddino_pretrained_path=None):
         super().__init__()
 
         self.use_local_stream = use_local_stream
         self.use_global_stream = use_global_stream
 
         if self.use_local_stream:
-            # 直接将权重路径传给 Wrapper，它会自动加载和处理
             self.local_stream = MedicalNet2D_Wrapper(
                 in_channels=in_channels,
                 pretrained_path=medicalnet_pretrained_path
             )
 
         if self.use_global_stream:
-            self.global_stream = RADDINO_Wrapper(in_channels=in_channels)
+            self.global_stream = RADDINO_Wrapper(
+                in_channels=in_channels,
+                pretrained_path=raddino_pretrained_path
+            )
 
     def forward(self, x):
         output = {}

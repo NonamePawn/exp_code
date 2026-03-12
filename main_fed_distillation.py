@@ -34,7 +34,7 @@ def main():
     # 基础实验设置
     parser.add_argument('--structure_name', type=str, default='fed_distill', help='架构名称')
     parser.add_argument('--data_root', type=str, default='/assets_processed', help='数据根目录')
-    parser.add_argument('--model', type=str, default='resnet50', help='模型名称')
+    parser.add_argument('--model', type=str, default='fdmff', help='模型名称')
     parser.add_argument('--device', type=str, default='cuda', help='运算设备')
 
     # 联邦学习设置
@@ -65,7 +65,7 @@ def main():
         f"Info: Structure={args.structure_name} | Model={args.model} | Data Root={args.data_root}",
         f"Settings: Batch Size={args.batch_size} | Learning Rate={args.learning_rate} | Device={DEVICE}",
         f"Federated Params: Clients={args.num_clients} | Rounds={args.rounds} | Local Epochs={args.local_epochs}",
-        f"Distill Params:  Alpha={args.kd_alpha} | Temp={args.kd_temp} | Public Epochs={args.public_pretrain_epochs}",
+        f"Distill Params:  Alpha={args.kd_alpha} | Temp={args.kd_temp}",
         hw_info
     ])
 
@@ -132,10 +132,10 @@ def main():
     # =================================================
     # [Step 4] 在线类原型蒸馏协同框架 (Class-Proto ODCM Loop)
     # =================================================
-    print(f"\n[3/5] 🚀 Starting ODCM Federated Distillation Loop (No Public Data)...")
+    print(f"\n[3/5] 🚀 Starting Federated Distillation Loop")
     best_acc = 0.0
     best_model_path = logger.save_dir / "best_fed_distill.pth"
-
+    start_time_total = time.time()
     for round_idx in range(1, args.rounds + 1):
         round_start = time.time()
         print(f"\n🔰 Round {round_idx} / {args.rounds}")
@@ -156,7 +156,7 @@ def main():
         # --- 阶段 3: 客户端在本地私有数据上协同演进 ---
         local_weights = []
         local_losses = []
-        with tqdm(total=args.num_clients, desc="   ⚗️ ODCM Distilling", ncols=100, colour='cyan') as pbar:
+        with tqdm(total=args.num_clients, desc="   ⚗️Distilling", ncols=100, colour='cyan') as pbar:
             for i, client in enumerate(clients):
                 w, loss = client.train_odcm_no_public(
                     local_model=local_models[i],
@@ -173,26 +173,39 @@ def main():
                 pbar.set_postfix({"Loss": f"{loss:.3f}"})
                 pbar.update(1)
 
-        # --- 阶段 4: 服务端验证聚合 (仅用于评估，不下发覆盖) ---
-        server.aggregate(local_weights)
-        val_acc, val_loss = server.evaluate()
+        # --- 阶段 4: 服务端验证聚合 (纯联邦蒸馏评估，坚决不用 FedAvg) ---
+        val_acc_list = []
+        val_loss_list = []
 
-        # ... 后续保存最佳模型和记录日志的代码保持不变 ...
+        # 依次评估每个客户端自己训练的个性化模型
+        for i in range(args.num_clients):
+            # 临时将客户端的权重装载到服务端的验证模型中进行测试
+            server.global_model.load_state_dict(local_weights[i])
+            c_acc, c_loss = server.evaluate()
+            val_acc_list.append(c_acc)
+            val_loss_list.append(c_loss)
+
+        # 计算所有客户端模型的平均表现，作为整个联邦系统的指标
+        val_acc = sum(val_acc_list) / len(val_acc_list)
+        val_loss = sum(val_loss_list) / len(val_loss_list)
+
+        # ... 后续打印日志的代码保持不变 ...
         round_time = time.time() - round_start
-
         print(
-            f"   📊 Round {round_idx}: Val Acc \033[92m{val_acc:.2f}%\033[0m | Loss {val_loss:.4f} | Time {round_time:.1f}s")
+            f"   📊 Round {round_idx}: Avg Val Acc \033[92m{val_acc:.2f}%\033[0m | Avg Loss {val_loss:.4f} | Time {round_time:.1f}s")
 
-        # 记录日志
-        logger.log_metrics(round_idx, sum(local_losses) / len(local_losses), 0, val_loss, val_acc, 0, round_time)
+        logger.log_metrics(round_idx, sum(local_losses) / len(local_losses), 0, val_loss, val_acc, 0,
+                           round_time)
 
+        # 联邦蒸馏保存最佳模型策略：保存本轮表现最好的那个客户端的模型！
         if val_acc > best_acc:
             best_acc = val_acc
-            torch.save(server.global_model.state_dict(), best_model_path)
-            print(f"   🏆 New Best Model Saved!")
+            best_client_idx = val_acc_list.index(max(val_acc_list))
+            torch.save(local_weights[best_client_idx], best_model_path)
+            print(
+                f"   🏆 New Best Saved! (Best Client: {best_client_idx} with Acc {val_acc_list[best_client_idx]:.2f}%)")
 
         # 清理显存 (删除临时的 Teacher)
-        del current_teacher
         torch.cuda.empty_cache()
 
     # =================================================

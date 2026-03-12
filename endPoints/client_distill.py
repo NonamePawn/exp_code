@@ -10,7 +10,6 @@ class DistillClient:
         self.device = device
         self.batch_size = batch_size
 
-        # 现在只有私有数据加载器，完全没有 public_dataset
         self.private_loader = DataLoader(private_dataset, batch_size=batch_size, shuffle=True)
 
         self.criterion_ce = nn.CrossEntropyLoss()

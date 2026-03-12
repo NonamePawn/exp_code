@@ -1,6 +1,7 @@
 # 排除大论文实验生成的中间数据和结果
 base/
 result/
+pretrained/
 
 # 排除 PyCharm 自动生成的本地配置文件（千万别传到 Git 上）
 .idea/
