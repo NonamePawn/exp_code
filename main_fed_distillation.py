@@ -25,42 +25,6 @@ def print_box(title, content_lines):
         print(f"║ {line.ljust(width - 2)} ║")
     print(f"╚{'═' * width}╝")
 
-
-def pretrain_teacher(model, loader, epochs, device):
-    """在联邦开始前，先让老师模型在公共数据上热身"""
-    print(f"\n Pre-training Teacher on Public Data ({epochs} Epochs)...")
-    model.train()
-    model.to(device)
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
-    criterion = torch.nn.CrossEntropyLoss()
-
-    for ep in range(epochs):
-        loss_sum = 0
-        correct = 0
-        total = 0
-        for imgs, labels in tqdm(loader, desc=f"   Pretrain Ep {ep + 1}/{epochs}", ncols=100):
-            imgs, labels = imgs.to(device), labels.to(device)
-            optimizer.zero_grad()
-
-            output = model(imgs)
-            if isinstance(output, tuple): output = output[0]
-
-            loss = criterion(output, labels)
-            loss.backward()
-            optimizer.step()
-
-            loss_sum += loss.item()
-            _, pred = torch.max(output, 1)
-            total += labels.size(0)
-            correct += (pred == labels).sum().item()
-
-        acc = 100 * correct / total
-        print(f"      -> Loss: {loss_sum / len(loader):.4f} | Acc: {acc:.2f}%")
-
-    print("   ✅ Teacher Pre-training Completed.")
-    return model
-
-
 def main():
     # =================================================
     # [Step 1] 参数配置 (Configuration)
@@ -83,7 +47,6 @@ def main():
     # [蒸馏核心参数]
     parser.add_argument('--kd_alpha', type=float, default=0.3, help='蒸馏权重 (0.3表示30%看老师, 70%看自己)')
     parser.add_argument('--kd_temp', type=float, default=4.0, help='蒸馏温度')
-    parser.add_argument('--public_pretrain_epochs', type=int, default=5, help='老师模型在公共数据上的预训练轮数')
 
     args = parser.parse_args()
 
@@ -119,7 +82,6 @@ def main():
     train_path = root_path / 'train'
     val_path = root_path / 'val'
     test_path = root_path / 'test'
-    public_path = root_path / 'public'
 
     # 1. 训练数据 (Client)
     train_partitioner = FederatedPartitioner(data_root=train_path, num_clients=args.num_clients)
@@ -133,21 +95,6 @@ def main():
     test_scanner = FederatedPartitioner(data_root=test_path, num_clients=1)
     test_loader = get_dataloader(test_scanner.data_indices, batch_size=args.batch_size, is_train=False)
 
-    # 3. 公共数据 (Public)
-    public_source_str = ""
-    if public_path.exists():
-        public_scanner = FederatedPartitioner(data_root=public_path, num_clients=1)
-        public_data_list = public_scanner.data_indices
-        public_source_str = f"External Dataset ('/public')"
-    else:
-        # Fallback: 使用 Test 集的一半
-        all_test_files = test_scanner.data_indices
-        split_idx = len(all_test_files) // 2
-        public_data_list = all_test_files[:split_idx]
-        public_source_str = "Proxy (50% of Test Set)"
-
-    # Server 预训练用的 Loader
-    public_loader = get_dataloader(public_data_list, batch_size=args.batch_size, is_train=True)
     num_classes = len(train_partitioner.class_map)
 
     # 打印汇总表
@@ -155,83 +102,82 @@ def main():
         f"Classes:       {num_classes}",
         f"Private Train: {total_private_samples} samples (Distributed to {args.num_clients} Clients)",
         f"               -> Avg {total_private_samples // args.num_clients} samples per Client",
-        f"Public Data:   {len(public_data_list)} samples",
-        f"               -> Source: {public_source_str}",
         f"Validation:    {len(val_scanner.data_indices)} samples",
         f"Test Data:     {len(test_scanner.data_indices)} samples"
     ])
 
     # =================================================
-    # [Step 3] 模型初始化 & 预训练 (Init & Pretrain)
+    # [Step 3] 模型初始化 (无预训练)
     # =================================================
     print(f"\n[2/5] 🤖 Initializing Models...")
     global_model = get_model(args.model, num_classes=num_classes)
     global_model.to(DEVICE)
 
-    # 利用公共数据集预训练 Teacher (Global Model)
-    if args.public_pretrain_epochs > 0:
-        global_model = pretrain_teacher(global_model, public_loader, args.public_pretrain_epochs, DEVICE)
-
-    # 初始化 Server 和 Clients
     server = Server(global_model, val_loader, DEVICE)
 
+    # 每个客户端维护属于自己的私有模型
+    local_models = [copy.deepcopy(global_model) for _ in range(args.num_clients)]
+
     clients = []
-    print(f"   -> Creating {args.num_clients} Clients with Public and Private Data...")
+    print(f"   -> Creating {args.num_clients} Clients with ONLY Private Data...")
     for i in range(args.num_clients):
         c = DistillClient(
             client_id=i,
             private_dataset=get_dataloader(private_data_map[i], args.batch_size, is_train=True).dataset,
-            public_dataset=get_dataloader(public_data_list, args.batch_size, is_train=True).dataset,
             device=DEVICE,
             batch_size=args.batch_size
         )
         clients.append(c)
 
     # =================================================
-    # [Step 4] 联邦蒸馏框架 (Training Framework)
+    # [Step 4] 在线类原型蒸馏协同框架 (Class-Proto ODCM Loop)
     # =================================================
-    print(f"\n[3/5] 🚀 Starting Federated Distillation Loop...")
+    print(f"\n[3/5] 🚀 Starting ODCM Federated Distillation Loop (No Public Data)...")
     best_acc = 0.0
-    start_time_total = time.time()
     best_model_path = logger.save_dir / "best_fed_distill.pth"
 
     for round_idx in range(1, args.rounds + 1):
         round_start = time.time()
         print(f"\n🔰 Round {round_idx} / {args.rounds}")
 
+        # --- 阶段 1: 各中心在私有数据上提取类原型 ---
+        print("   📡 Extracting Class-wise Logits from clients' private data...")
+        all_class_logits = {}
+        all_class_counts = {}
+        for i, client in enumerate(clients):
+            c_logits, c_counts = client.get_local_class_logits(local_models[i])
+            all_class_logits[i] = c_logits
+            all_class_counts[i] = c_counts
+
+        # --- 阶段 2: 服务端排他性聚合 ---
+        # 计算每个客户端专属的虚拟教师类别知识 z_{-k}
+        exclusive_class_logits_dict = server.compute_exclusive_class_logits(all_class_logits, all_class_counts)
+
+        # --- 阶段 3: 客户端在本地私有数据上协同演进 ---
         local_weights = []
         local_losses = []
-
-        # 每一轮开始前，Server 的模型就是当前的 Teacher
-        # 我们需要复制一份作为 Teacher 发给 Client (为了不影响 Server 自身的聚合)
-        current_teacher = copy.deepcopy(server.global_model)
-
-        # --- Client Training Loop ---
-        with tqdm(total=args.num_clients, desc="   ⚗️ Distilling", ncols=100, colour='cyan') as pbar:
-            for client in clients:
-                # 1. 同步参数：学生模型继承上一轮的全局参数
-                student_model = copy.deepcopy(server.global_model)
-
-                # 2. 蒸馏训练：传入学生(待训) 和 老师(冻结)
-                w, loss = client.train_distill(
-                    student_model=student_model,
-                    teacher_model=current_teacher,
+        with tqdm(total=args.num_clients, desc="   ⚗️ ODCM Distilling", ncols=100, colour='cyan') as pbar:
+            for i, client in enumerate(clients):
+                w, loss = client.train_odcm_no_public(
+                    local_model=local_models[i],
+                    exclusive_class_logits=exclusive_class_logits_dict[i],
                     epochs=args.local_epochs,
                     lr=args.learning_rate,
                     alpha=args.kd_alpha,
                     temperature=args.kd_temp
                 )
-
                 local_weights.append(w)
                 local_losses.append(loss)
+                local_models[i].load_state_dict(w)  # 本地模型自我保留
+
                 pbar.set_postfix({"Loss": f"{loss:.3f}"})
                 pbar.update(1)
 
-        # --- Server Aggregation ---
+        # --- 阶段 4: 服务端验证聚合 (仅用于评估，不下发覆盖) ---
         server.aggregate(local_weights)
-
-        # --- Evaluation ---
         val_acc, val_loss = server.evaluate()
+
+        # ... 后续保存最佳模型和记录日志的代码保持不变 ...
         round_time = time.time() - round_start
 
         print(

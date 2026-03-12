@@ -60,6 +60,46 @@ class Server:
 
         return acc, avg_loss
 
+    def compute_exclusive_class_logits(self, all_client_class_logits, all_client_class_counts):
+        """
+        [大论文核心] 计算基于类别的排他性聚合知识 (Class-wise Virtual Teacher)
+        输入:
+            all_client_class_logits: {client_id: {class_id: mean_logit_tensor}}
+            all_client_class_counts: {client_id: {class_id: sample_count}}
+        """
+        global_class_sum = {}
+        global_class_count = {}
+
+        # 1. 计算全局所有类别的 Logits 累加和及总样本数
+        for cid, class_logits in all_client_class_logits.items():
+            for lbl, logits in class_logits.items():
+                count = all_client_class_counts[cid][lbl]
+                if lbl not in global_class_sum:
+                    global_class_sum[lbl] = logits * count
+                    global_class_count[lbl] = count
+                else:
+                    global_class_sum[lbl] += logits * count
+                    global_class_count[lbl] += count
+
+        exclusive_teacher_logits = {}
+
+        # 2. 为每个客户端剔除其自身后，计算专属的类原型老师
+        for cid in all_client_class_logits.keys():
+            exclusive_teacher_logits[cid] = {}
+            for lbl in all_client_class_logits[cid].keys():
+                count = all_client_class_counts[cid][lbl]
+                # 排他性：减去自己的部分
+                exc_sum = global_class_sum[lbl] - all_client_class_logits[cid][lbl] * count
+                exc_count = global_class_count[lbl] - count
+
+                if exc_count > 0:
+                    exclusive_teacher_logits[cid][lbl] = exc_sum / exc_count
+                else:
+                    # 如果只有当前客户端有这个类别，就沿用自己上一轮的知识作为平滑
+                    exclusive_teacher_logits[cid][lbl] = all_client_class_logits[cid][lbl]
+
+        return exclusive_teacher_logits
+
     def run_final_test(self, model_path, test_loader=None):
         """
         [最终测试] 完全复刻 main_central.py 的逻辑
