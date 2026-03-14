@@ -29,11 +29,10 @@ class FDMFF(nn.Module):
         self.dhfem = DHFEM(
             in_channels=5,
             use_local_stream=True,
-            use_global_stream=True,
+            use_global_stream=False,
             medicalnet_pretrained_path=medicalnet_pretrained_path,
-            raddino_pretrained_path = raddino_pretrained_path  # 新增
+            raddino_pretrained_path = raddino_pretrained_path
         )
-
         # 3. 动态特征融合模块 (接收 768 维 Token，输出分类结果)
         # 默认 DHFEM 输出维度是 768
         self.dffm = DFFM(dim=768, num_classes=num_classes)
@@ -54,8 +53,17 @@ class FDMFF(nn.Module):
         local_tokens = features_dict['local_tokens']  # (Batch, N_local, 768)
         global_tokens = features_dict['global_tokens']  # (Batch, N_global, 768)
 
-        # --- 阶段 3: 动态交叉融合与分类 ---
-        # 输出形状: (Batch, num_classes)
-        logits = self.dffm(local_tokens, global_tokens)
+        # --- 新增的转换逻辑开始 ---
+        # 1. 通道降维: (Batch, 2048, 16, 16) -> (Batch, 768, 16, 16)
+        local_tokens = self.local_proj(local_tokens)
 
+        # 2. 展平为 Token 序列: 把 16x16 的空间拉直成 256 个 Token
+        B, C, H, W = local_tokens.shape
+        # reshape 后变成 (Batch, 768, 256)，然后再 permute 翻转维度变成 (Batch, 256, 768)
+        local_tokens = local_tokens.view(B, C, -1).permute(0, 2, 1)
+        # --- 新增的转换逻辑结束 ---
+
+
+        # 3. 此时双流的维度完美对齐，送入融合模块！
+        logits = self.dffm(local_tokens, global_tokens)
         return logits
