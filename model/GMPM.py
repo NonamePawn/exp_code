@@ -2,8 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-
-
 # ==========================================
 # 1. 手工特征提取分支 (Hand-crafted Features)
 # ==========================================
@@ -119,8 +117,9 @@ class AdaptiveConstrainedFilter(nn.Module):
 
 class GMPM(nn.Module):
     """
-    门控多通道预处理模块 (GMPM)
-    您可以根据需要，在初始化时通过传入 False 来关闭某个分支，完美支持大论文 3.3.5 节的消融实验。
+    门控多通道融合处理模块 (Gated Multi-channel Processing Module)
+    输入: 原始单通道 CT 切片 (B, 1, H, W)
+    输出: 门控加权融合后的单通道超级切片 (B, 1, H, W)
     """
 
     def __init__(self,
@@ -184,6 +183,11 @@ class GMPM(nn.Module):
         # 3. 动态加权特征
         X_weighted = X_concat * s
 
-        # 大论文中提到："修改了第一层卷积的输入通道数，使其与GMPM输出的通道数量对齐"
-        # 这意味着我们将输出加权后的 5 通道张量给下游双流网络，而不是把它简单求和成 1 通道。
-        return X_weighted
+        # ==========================================
+        # 🌟 核心修改：门控加权融合 (Gated Fusion)
+        # 将加权后的多通道特征在通道维度(dim=1)上求和
+        # 维度转变: (Batch, 5, H, W) -> (Batch, 1, H, W)
+        # ==========================================
+        X_fused = X_weighted.sum(dim=1, keepdim=True)
+
+        return X_fused

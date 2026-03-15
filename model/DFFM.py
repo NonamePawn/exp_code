@@ -1,120 +1,83 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
-
-
-class CrossAttentionBlock(nn.Module):
-    """
-    基础跨域交叉注意力块
-    实现了 Q 和 K, V 来自不同特征流的注意力机制
-    """
-
-    def __init__(self, dim):
-        super().__init__()
-        self.scale = dim ** -0.5
-
-        # 定义投影矩阵 W_Q, W_K, W_V
-        self.proj_q = nn.Linear(dim, dim)
-        self.proj_k = nn.Linear(dim, dim)
-        self.proj_v = nn.Linear(dim, dim)
-
-    def forward(self, x_q, x_kv):
-        """
-        x_q: 提供 Query 的特征流 (例如局部特征)
-        x_kv: 提供 Key 和 Value 的特征流 (例如全局特征)
-        """
-        # 生成 Q, K, V
-        Q = self.proj_q(x_q)  # (Batch, N_q, dim)
-        K = self.proj_k(x_kv)  # (Batch, N_kv, dim)
-        V = self.proj_v(x_kv)  # (Batch, N_kv, dim)
-
-        # 计算点积相似度并生成动态权重图 Softmax(Q * K^T / sqrt(d_k))
-        attn = (Q @ K.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-
-        # 乘以 Value 得到交互后的特征
-        out = attn @ V
-
-        # 返回注意力计算结果以及当前分支保留的原始物理特征 V'
-        return out, V
 
 
 class DFFM(nn.Module):
     """
-    动态特征融合模块 (Dynamic Feature Fusion Module)
-    包含：跨域对齐投影、双向交叉注意力交互、动态特征集成、多级分类决策头
+    动态特征融合模块
+    输入: local_feat (B, 2048, 16, 16), global_feat (B, 1369, 768)
+    输出: logits (B, num_classes)
     """
 
-    def __init__(self, dim=768, num_classes=13, dropout_rate=0.5):
-        """
-        dim: 输入特征的维度 (DHFEM 输出默认是 768)
-        num_classes: CT设备类别的数量 (根据大论文数据集表3-3，默认13种型号)
-        """
+    def __init__(self, cnn_dim=2048, vit_dim=768, num_classes=13, use_radimagenet=True, use_raddino=True):
         super().__init__()
+        self.use_radimagenet = use_radimagenet
+        self.use_raddino = use_raddino
 
-        # 1. 双向交叉注意力交互层
-        # Local -> Global: 局部从全局获取补充信息
-        self.attn_l_from_g = CrossAttentionBlock(dim)
-        # Global -> Local: 全局从局部获取补充信息
-        self.attn_g_from_l = CrossAttentionBlock(dim)
+        # ==========================================
+        # 根据消融开关初始化组件
+        # ==========================================
+        if self.use_radimagenet and self.use_raddino:
+            classifier_in_dim = vit_dim * 2  # 1536
 
-        # 2. 层归一化 (Layer Normalization)，保持训练稳定性
-        self.norm_l = nn.LayerNorm(dim)
-        self.norm_g = nn.LayerNorm(dim)
+            # 维度对齐层
+            self.local_proj = nn.Conv2d(cnn_dim, vit_dim, kernel_size=1)
+            # 交叉注意力
+            self.attn_l_g = nn.MultiheadAttention(embed_dim=vit_dim, num_heads=8, batch_first=True)
+            self.attn_g_l = nn.MultiheadAttention(embed_dim=vit_dim, num_heads=8, batch_first=True)
+            self.norm_l = nn.LayerNorm(vit_dim)
+            self.norm_g = nn.LayerNorm(vit_dim)
 
-        # 3. 多级分类决策头 (MLP)
-        # 融合后的特征维度是 dim * 2 (因为 Concat 拼接了两个分支)
-        fused_dim = dim * 2
+        elif self.use_radimagenet and not self.use_raddino:
+            classifier_in_dim = cnn_dim  # 2048
 
-        # 包含 W1, ReLU (σ), Dropout (掩码m), W2
+        elif not self.use_radimagenet and self.use_raddino:
+            classifier_in_dim = vit_dim  # 768
+        else:
+            raise ValueError("至少需要开启一个分支！")
+
+        # ==========================================
+        # 统一的分类决策头
+        # ==========================================
         self.classifier = nn.Sequential(
-            nn.Linear(fused_dim, fused_dim // 2),
-            nn.BatchNorm1d(fused_dim // 2),
-            nn.ReLU(inplace=True),  # σ
-            nn.Dropout(p=dropout_rate),  # ⊙ m (随机掩码向量)
-            nn.Linear(fused_dim // 2, num_classes)  # W2
+            nn.Linear(classifier_in_dim, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(512, num_classes)
         )
 
-    def forward(self, local_features, global_features):
-        """
-        local_features: 来自 MedicalNet 的局部特征, 形状 (Batch, N_local, dim)
-        global_features: 来自 RAD-DINO 的全局特征, 形状 (Batch, N_global, dim)
-        """
-        # ==========================================
-        # 1. 双向交叉注意力交互 (Bidirectional Cross-Attention)
-        # ==========================================
+    def forward(self, local_feat, global_feat):
+        # 1. 双分支融合逻辑
+        if self.use_radimagenet and self.use_raddino:
+            # 空间上采样对齐: 16x16 -> 37x37
+            local_aligned = F.interpolate(local_feat, size=(37, 37), mode='bilinear', align_corners=False)
+            # 降维并展平: (B, 2048, 37, 37) -> (B, 768, 37, 37) -> (B, 1369, 768)
+            local_mapped = self.local_proj(local_aligned)
+            local_tokens = local_mapped.flatten(2).transpose(1, 2)
 
-        # Attn_{L <- G}: Q来自Local, K/V来自Global
-        attn_l, v_g_prime = self.attn_l_from_g(x_q=local_features, x_kv=global_features)
+            # 交叉注意力交互
+            attn_out_l, _ = self.attn_l_g(query=local_tokens, key=global_feat, value=global_feat)
+            attn_out_g, _ = self.attn_g_l(query=global_feat, key=local_tokens, value=local_tokens)
 
-        # Attn_{G <- L}: Q来自Global, K/V来自Local
-        attn_g, v_l_prime = self.attn_g_from_l(x_q=global_features, x_kv=local_features)
+            # 残差连接
+            fused_local = self.norm_l(local_tokens + attn_out_l)
+            fused_global = self.norm_g(global_feat + attn_out_g)
 
-        # ==========================================
-        # 2. 动态特征集成 (Dynamic Feature Integration)
-        # ==========================================
+            # 全局池化与拼接: (B, 1369, 768) -> (B, 768) -> (B, 1536)
+            vec_local = fused_local.mean(dim=1)
+            vec_global = fused_global.mean(dim=1)
+            final_vector = torch.cat([vec_local, vec_global], dim=1)
 
-        # 残差连接 + LayerNorm: LN(V_L' + Attn_{L <- G})
-        # 注意: 为了维度匹配进行相加，我们使用 local_features (或从它投影出的 V)
-        # 此处使用投影后的 v_l_prime 的形状是 (Batch, N_local, dim)
-        out_l = self.norm_l(v_l_prime + attn_l)
+        # 2. 仅 CNN 逻辑
+        elif self.use_radimagenet and not self.use_raddino:
+            final_vector = F.adaptive_avg_pool2d(local_feat, (1, 1)).flatten(1)
 
-        # 残差连接 + LayerNorm: LN(V_G' + Attn_{G <- L})
-        out_g = self.norm_g(v_g_prime + attn_g)
+        # 3. 仅 ViT 逻辑
+        elif not self.use_radimagenet and self.use_raddino:
+            final_vector = global_feat.mean(dim=1)
 
-        # 在送入分类器前，将序列特征压缩为一维向量 (Global Average Pooling)
-        out_l_pooled = out_l.mean(dim=1)  # (Batch, dim)
-        out_g_pooled = out_g.mean(dim=1)  # (Batch, dim)
-
-        # 在通道维度上进行特征堆叠 Concat
-        v_fused = torch.cat([out_l_pooled, out_g_pooled], dim=1)  # (Batch, dim * 2)
-
-        # ==========================================
-        # 3. 多级分类决策头 (Multi-level Classification Head)
-        # ==========================================
-
-        # 得到最终的设备类别 Logits (P_result 未过 Softmax，以便与交叉熵损失配合)
-        logits = self.classifier(v_fused)
-
+        # 分类输出
+        logits = self.classifier(final_vector)
         return logits

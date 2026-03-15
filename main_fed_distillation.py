@@ -111,12 +111,14 @@ def main():
     # =================================================
     print(f"\n[2/5] 🤖 Initializing Models...")
     global_model = get_model(args.model, num_classes=num_classes)
+
+    # 【修复点 1】：先在 CPU 上复制 10 份，绝对不要在 GPU 上复制！
+    local_models = [copy.deepcopy(global_model) for _ in range(args.num_clients)]
+
+    # 复制完之后，再把服务端模型放上 GPU
     global_model.to(DEVICE)
 
     server = Server(global_model, val_loader, DEVICE)
-
-    # 每个客户端维护属于自己的私有模型
-    local_models = [copy.deepcopy(global_model) for _ in range(args.num_clients)]
 
     clients = []
     print(f"   -> Creating {args.num_clients} Clients with ONLY Private Data...")
@@ -144,10 +146,14 @@ def main():
         print("   📡 Extracting Class-wise Logits from clients' private data...")
         all_class_logits = {}
         all_class_counts = {}
-        for i, client in enumerate(clients):
-            c_logits, c_counts = client.get_local_class_logits(local_models[i])
-            all_class_logits[i] = c_logits
-            all_class_counts[i] = c_counts
+        # 【修复点 2】：加上最外层的 TQDM 进度条
+        with tqdm(total=args.num_clients, desc="   🔍 Extracting", ncols=100, colour='yellow') as pbar:
+            for i, client in enumerate(clients):
+                # 此时提取特征，客户端内部会把自己的 local_models[i] 放上 GPU，算完再拿下来
+                c_logits, c_counts = client.get_local_class_logits(local_models[i])
+                all_class_logits[i] = c_logits
+                all_class_counts[i] = c_counts
+                pbar.update(1)
 
         # --- 阶段 2: 服务端排他性聚合 ---
         # 计算每个客户端专属的虚拟教师类别知识 z_{-k}
@@ -191,21 +197,28 @@ def main():
 
         # ... 后续打印日志的代码保持不变 ...
         round_time = time.time() - round_start
-        print(
-            f"   📊 Round {round_idx}: Avg Val Acc \033[92m{val_acc:.2f}%\033[0m | Avg Loss {val_loss:.4f} | Time {round_time:.1f}s")
-
         logger.log_metrics(round_idx, sum(local_losses) / len(local_losses), 0, val_loss, val_acc, 0,
                            round_time)
 
-        # 联邦蒸馏保存最佳模型策略：保存本轮表现最好的那个客户端的模型！
-        if val_acc > best_acc:
-            best_acc = val_acc
-            best_client_idx = val_acc_list.index(max(val_acc_list))
+        # ==========================================
+        # 🌟 核心修改：全能王保存策略
+        # ==========================================
+        # 1. 找出本轮所有客户端里的“单科最高分”及其索引
+        current_max_acc = max(val_acc_list)
+        best_client_idx = val_acc_list.index(current_max_acc)
+
+        # 2. 打印一下本轮的极值情况，方便你监控
+        print(
+            f"   📈 Round {round_idx} Max Acc: {current_max_acc:.2f}% (from Client {best_client_idx}) | Avg Acc: {val_acc:.2f}%")
+
+        # 3. 只有当“单科最高分”打破了历史记录，才保存为全能王！
+        if current_max_acc > best_acc:
+            best_acc = current_max_acc
             torch.save(local_weights[best_client_idx], best_model_path)
             print(
-                f"   🏆 New Best Saved! (Best Client: {best_client_idx} with Acc {val_acc_list[best_client_idx]:.2f}%)")
+                f"   🏆 [全能王诞生！] New Best Model Saved! Client {best_client_idx} hit the historical peak: {best_acc:.2f}%")
 
-        # 清理显存 (删除临时的 Teacher)
+        # 清理显存
         torch.cuda.empty_cache()
 
     # =================================================

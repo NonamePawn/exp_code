@@ -1,204 +1,115 @@
 import torch
 import torch.nn as nn
-import torchvision.models as models
-import timm  # 用于加载 Transformer (ViT) 模型
-import os
 import torch.nn.functional as F
-from transformers import ViTModel
-# 设置国内镜像，防止服务器下载超时
-os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
-# ==========================================
-# 1. 局部纹理流: MedicalNet 2D 重构版本 (内嵌 3D->2D 权重转换)
-# ==========================================
+import torchvision.models as models
+from transformers import AutoModel
 
-class MedicalNet2D_Wrapper(nn.Module):
+class RadImageNetExtractor(nn.Module):
     """
-    MedicalNet (23 datasets) 适配器: 将 3D ResNet 权重转换为 2D 并自动进行 5 通道适配
+    独立类 1: 负责提取局部空间特征的 CNN 网络
+    采用输入适配策略，保持原网络 3 通道结构零修改
     """
 
-    def __init__(self, base_model_name='resnet50', in_channels=5, pretrained_path=None):
+    def __init__(self, in_channels=1, pretrained_path=None):
         super().__init__()
-        self.in_channels = in_channels
 
-        # 1. 实例化一个标准的 2D ResNet (空壳)
-        if base_model_name == 'resnet50':
-            self.backbone = models.resnet50(weights=None)
-            self.feature_dim = 2048
-        elif base_model_name == 'resnet18':
-            self.backbone = models.resnet18(weights=None)
-            self.feature_dim = 512
-        else:
-            raise ValueError("不支持的 ResNet 版本，请选择 resnet18 或 resnet50")
+        # 1. 通道适配器 (Channel Adapter)
+        self.adapter = nn.Conv2d(in_channels, 3, kernel_size=1, stride=1, padding=0)
 
-        # 2. 修改第一层卷积以接受 5 通道输入
-        original_conv = self.backbone.conv1
-        self.backbone.conv1 = nn.Conv2d(
-            in_channels=self.in_channels,
-            out_channels=original_conv.out_channels,
-            kernel_size=original_conv.kernel_size,
-            stride=original_conv.stride,
-            padding=original_conv.padding,
-            bias=False
-        )
+        # 2. 原封不动的标准 ResNet50 (3 通道)
+        self.cnn = models.resnet50(weights=None)
 
-        # 3. 加载并转换 MedicalNet 3D 权重
-        if pretrained_path is not None:
-            self._load_3d_pretrained_weights(pretrained_path)
+        # 尝试加载 RadImageNet 预训练权重
+        try:
+            state_dict = torch.load(pretrained_path, map_location='cpu')
+            new_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+            self.cnn.load_state_dict(new_state_dict, strict=False)
+            print(f"✅ RadImageNet 预训练权重加载成功！(路径: {pretrained_path})")
+        except FileNotFoundError:
+            print(f"⚠️ 警告: 未找到 {pretrained_path}，使用随机初始化权重。")
 
-    def _load_3d_pretrained_weights(self, pth_path):
-        print(f"====== 开始为 MedicalNet2D 加载并转换 3D 预训练权重 ======")
-        checkpoint = torch.load(pth_path, map_location='cpu')
+        # 剥离最后两层，保留空间特征图
+        self.cnn = nn.Sequential(*list(self.cnn.children())[:-2])
 
-        # 兼容不同保存格式
-        state_dict_3d = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
+    def forward(self, x_multi):
+        # x_multi: (B, 5, 512, 512) -> adapter -> (B, 3, 512, 512) -> cnn -> (B, 2048, 16, 16)
+        x_3c = self.adapter(x_multi)
+        return self.cnn(x_3c)
 
-        model_state_dict = self.backbone.state_dict()
-        new_state_dict = {}
-        loaded_layers = 0
 
-        for key, weight_3d in state_dict_3d.items():
-            # MedicalNet 的 key 通常带有 'module.' 前缀，需要去掉以对齐 2D ResNet
-            key_2d = key.replace('module.', '')
-
-            if key_2d in model_state_dict:
-                weight_2d = weight_3d
-
-                # 【核心手术 1】：将 3D 卷积核 (out, in, D, H, W) 压缩为 2D 卷积核 (out, in, H, W)
-                if len(weight_3d.shape) == 5:
-                    weight_2d = weight_3d.mean(dim=2)
-
-                # 【核心手术 2 - 致命Bug已修复】：
-                # 严格限制：只修改名字叫 'conv1.weight' 且 名字里绝不包含 'layer' 的最外层卷积！
-                # 这样就保护了深层网络 (如 layer1.0.conv1.weight) 不被错误地拍扁成 5 通道。
-                if 'conv1.weight' in key_2d and 'layer' not in key_2d and weight_2d.shape[1] != self.in_channels:
-                    print(f"    -> 正在对齐最外层 {key_2d} 的输入通道: {weight_2d.shape[1]} -> {self.in_channels}")
-                    # 取均值并复制成 5 份
-                    mean_weight = weight_2d.mean(dim=1, keepdim=True)
-                    weight_2d = mean_weight.repeat(1, self.in_channels, 1, 1)
-
-                if weight_2d.shape == model_state_dict[key_2d].shape:
-                    new_state_dict[key_2d] = weight_2d
-                    loaded_layers += 1
-            else:
-                pass  # 忽略维度或名称不匹配的废弃层 (比如全连接层)
-
-        self.backbone.load_state_dict(new_state_dict, strict=False)
-        print(f"====== MedicalNet 权重装载完成！共完美转换 {loaded_layers} 个张量 ======")
-
-    def forward(self, x):
-        # ResNet 前向传播，去掉最后的全连接层和全局池化层，只保留特征图提取局部 token
-        x = self.backbone.conv1(x)
-        x = self.backbone.bn1(x)
-        x = self.backbone.relu(x)
-        x = self.backbone.maxpool(x)
-
-        x = self.backbone.layer1(x)
-        x = self.backbone.layer2(x)
-        x = self.backbone.layer3(x)
-        x = self.backbone.layer4(x)
-
-        # 输出的形状是 (Batch, 2048, H', W')
-        # 这些将作为局部流的 Patch Tokens 喂给后续的融合模块
-        return x
-
-# ==========================================
-# 2. 全局关联流: RAD-DINO (ViT) 适配器
-# ==========================================
-
-class RADDINO_Wrapper(nn.Module):
+class RadDINOExtractor(nn.Module):
     """
-    RAD-DINO 适配器 (使用官方 Transformers 库，并自动进行 5 通道手术)
+    独立类 2: 负责提取全局序列特征的 ViT 网络
+    纯本地加载模式，彻底告别网络请求
     """
 
-    def __init__(self, in_channels=5, pretrained_path=None):
+    def __init__(self, in_channels=1, pretrained_path=None):
         super().__init__()
-        self.in_channels = in_channels
 
-        print("====== 正在通过 transformers 加载官方 RAD-DINO ======")
-        # 直接从 HuggingFace 镜像拉取 RAD-DINO 的结构和纯净权重
-        self.vit = ViTModel.from_pretrained('microsoft/rad-dino', add_pooling_layer=False)
-        # -----------------------------------------------------------------
-        # 【刚刚新增的 2 行修复代码】：修改 HF 底层的说明书，撤销写死的 3 通道检查
-        self.vit.config.num_channels = self.in_channels
-        self.vit.embeddings.patch_embeddings.num_channels = self.in_channels
-        # -----------------------------------------------------------------
-        # 进行 5 通道手术
-        original_conv = self.vit.embeddings.patch_embeddings.projection
+        # 1. 通道适配器
+        self.adapter = nn.Conv2d(in_channels, 3, kernel_size=1, stride=1, padding=0)
 
-        # 1. 制造一个全新的 5 通道卷积层
-        new_conv = nn.Conv2d(
-            in_channels=self.in_channels,
-            out_channels=original_conv.out_channels,
-            kernel_size=original_conv.kernel_size,
-            stride=original_conv.stride,
-            padding=original_conv.padding
-        )
+        # 2. 纯本地加载核心逻辑
+        print(f"⏳ 正在从本地路径 [{pretrained_path}] 加载 RadDINO 预训练权重...")
 
-        # 2. 将官方预训练的单通道权重取均值，复制成 5 份注入新卷积核
-        with torch.no_grad():
-            mean_weight = original_conv.weight.mean(dim=1, keepdim=True)
-            new_conv.weight.copy_(mean_weight.repeat(1, self.in_channels, 1, 1))
-            if original_conv.bias is not None:
-                new_conv.bias.copy_(original_conv.bias)
+        try:
+            # 【核心修改】把 ViTModel 换成 AutoModel
+            self.vit = AutoModel.from_pretrained(
+                pretrained_path,
+                local_files_only=True
+            )
+            print("✅ RadDINO 本地预训练权重加载成功！(原生态 3 通道 DINOv2 架构)")
+        except Exception as e:
+            print(f"\n❌ RadDINO 加载失败！")
+            print(f"请检查本地文件夹 '{pretrained_path}' 中是否完整包含必须的模型文件。")
+            print(f"通常需要: config.json 和 pytorch_model.bin (或 model.safetensors)")
+            raise e
 
-        # 3. 替换掉 ViT 内部的旧层
-        self.vit.embeddings.patch_embeddings.projection = new_conv
-        print("====== RAD-DINO 5通道适配与加载完美完成！======")
+    def forward(self, x_multi):
+        # x_multi: (B, 5, 512, 512) -> 插值 -> (B, 5, 518, 518) -> adapter -> (B, 3, 518, 518)
+        x_resized = F.interpolate(x_multi, size=(518, 518), mode='bilinear', align_corners=False)
+        x_3c = self.adapter(x_resized)
 
-    def forward(self, x):
-        # 专门为 ViT 缩放尺寸到 224x224
-        x_resized = F.interpolate(x, size=(518, 518), mode='bilinear', align_corners=False)
+        # 送入原生态 ViT
+        vit_outputs = self.vit(pixel_values=x_3c)
 
-        # transformers 的输出结构是一个对象，我们需要提取 last_hidden_state
-        outputs = self.vit(pixel_values=x_resized)
-        tokens = outputs.last_hidden_state  # 形状: (Batch, N, 768)
+        # 剥离 cls_token，保留 1369 个空间 patch tokens
+        # 输出: (B, 1369, 768)
+        global_tokens = vit_outputs.last_hidden_state[:, 1:, :]
+        return global_tokens
 
-        cls_token = tokens[:, 0, :]  # (Batch, 768)
-        patch_tokens = tokens[:, 1:, :]  # (Batch, N-1, 768)
-
-        return cls_token, patch_tokens
-
-# ==========================================
-# 3. 双流异构特征提取总模块 (DHFEM)
-# ==========================================
 
 class DHFEM(nn.Module):
     """
-    双流异构特征提取模块
+    特征提取总成模块
     """
 
-    def __init__(self, in_channels=5, use_local_stream=True, use_global_stream=True,
-                 medicalnet_pretrained_path=None, raddino_pretrained_path=None):
+    def __init__(self, use_radimagenet=True, use_raddino=True,
+                 radimagenet_path='./pretrained/radImageNet_resNet50.pt',
+                 raddino_path='./pretrained/rad_dino_weights'):
+        """
+        参数说明:
+        radimagenet_path: RadImageNet 的 .pth 权重文件路径
+        raddino_path: RadDINO 的本地文件夹路径
+        """
         super().__init__()
+        self.use_radimagenet = use_radimagenet
+        self.use_raddino = use_raddino
 
-        self.use_local_stream = use_local_stream
-        self.use_global_stream = use_global_stream
+        if self.use_radimagenet:
+            self.cnn_extractor = RadImageNetExtractor(in_channels=1, pretrained_path=radimagenet_path)
 
-        if self.use_local_stream:
-            self.local_stream = MedicalNet2D_Wrapper(
-                in_channels=in_channels,
-                pretrained_path=medicalnet_pretrained_path
-            )
+        if self.use_raddino:
+            self.vit_extractor = RadDINOExtractor(in_channels=1, pretrained_path=raddino_path)
 
-        if self.use_global_stream:
-            self.global_stream = RADDINO_Wrapper(
-                in_channels=in_channels,
-                pretrained_path=raddino_pretrained_path
-            )
+    def forward(self, x_multi):
+        local_feat = None
+        global_feat = None
 
-    def forward(self, x):
-        output = {}
-        if self.use_local_stream:
-            output['local_tokens'] = self.local_stream(x)
-        else:
-            output['local_tokens'] = None
+        if self.use_radimagenet:
+            local_feat = self.cnn_extractor(x_multi)
 
-        if self.use_global_stream:
-            cls_token, patch_tokens = self.global_stream(x)
-            output['global_cls'] = cls_token
-            output['global_tokens'] = patch_tokens
-        else:
-            output['global_cls'] = None
-            output['global_tokens'] = None
+        if self.use_raddino:
+            global_feat = self.vit_extractor(x_multi)
 
-        return output
+        return local_feat, global_feat

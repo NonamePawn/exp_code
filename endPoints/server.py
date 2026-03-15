@@ -35,28 +35,41 @@ class Server:
         total = 0
 
         with torch.no_grad():
-            # leave=False 防止每轮进度条刷屏
-            for images, labels in self.val_loader:
+            # 🌟 优化1：加上蓝色的测试专属进度条
+            val_pbar = tqdm(self.val_loader, desc="   📊 Server Evaluating", leave=False, ncols=80, colour='blue')
+
+            for images, labels in val_pbar:
                 images, labels = images.to(self.device), labels.to(self.device)
 
-                output = self.global_model(images)
+                # 🌟 优化2：开启混合精度极速推理
+                with torch.cuda.amp.autocast():
+                    output = self.global_model(images)
 
-                # 兼容性处理：如果模型返回 (logits, features)，只取 logits
-                if isinstance(output, tuple):
-                    logits = output[0]
-                else:
-                    logits = output
+                    # 兼容性处理：如果模型返回 (logits, features)，只取 logits
+                    if isinstance(output, tuple):
+                        logits = output[0]
+                    else:
+                        logits = output
 
-                loss = self.criterion(logits, labels)
+                    loss = self.criterion(logits, labels)
+
                 loss_sum += loss.item()
 
                 _, predicted = torch.max(logits, 1)
                 total += labels.size(0)
                 correct += (predicted == labels).sum().item()
 
+                # 🌟 优化3：进度条实时反馈
+                current_acc = 100 * correct / total if total > 0 else 0
+                val_pbar.set_postfix({'Acc': f"{current_acc:.2f}%", 'Loss': f"{loss.item():.3f}"})
+
         # 防止除零
         acc = 100 * correct / total if total > 0 else 0
         avg_loss = loss_sum / len(self.val_loader) if len(self.val_loader) > 0 else 0
+
+        # 🌟 优化4：测试完毕释放显存
+        self.global_model.cpu()
+        torch.cuda.empty_cache()
 
         return acc, avg_loss
 
@@ -124,11 +137,12 @@ class Server:
         all_features = []
 
         with torch.no_grad():
-            for images, labels in tqdm(target_loader, desc="   📊 Extracting", ncols=100):
+            for images, labels in tqdm(target_loader, desc="   📊 Extracting", ncols=100, colour='magenta'):
                 images = images.to(self.device)
 
-                # --- [逻辑复刻核心区] ---
-                output = self.global_model(images)
+                # 🌟 优化：开启混合精度加速特征提取
+                with torch.cuda.amp.autocast():
+                    output = self.global_model(images)
 
                 features = None
                 # 判断模型是否返回了特征
@@ -158,5 +172,8 @@ class Server:
         preds = np.concatenate(all_preds, axis=0)
         labels = np.concatenate(all_labels, axis=0)
         features = np.concatenate(all_features, axis=0) if all_features else np.array([])
+
+        self.global_model.cpu()
+        torch.cuda.empty_cache()
 
         return features, labels, preds, logits
