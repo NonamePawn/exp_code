@@ -69,7 +69,7 @@ class Server:
 
         # 🌟 优化4：测试完毕释放显存
         self.global_model.cpu()
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()
 
         return acc, avg_loss
 
@@ -174,6 +174,6 @@ class Server:
         features = np.concatenate(all_features, axis=0) if all_features else np.array([])
 
         self.global_model.cpu()
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()
 
         return features, labels, preds, logits

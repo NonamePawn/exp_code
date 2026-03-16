@@ -60,6 +60,30 @@ def main():
         DEVICE = torch.device("cpu")
         hw_info = "🐢 Device: CPU"
 
+    # ==========================================
+    # 🛡️ 实验室生存法则：显存占位护盾
+    # ==========================================
+    if DEVICE.type == 'cuda':
+        print("\n[0/5] 🛡️ Activating VRAM Guard to prevent resource hijacking...")
+        # 我们预先强行申请 23GB 的显存 (23 * 1024 * 1024 * 1024 bytes)
+        # 因为 float32 占 4 个字节，所以除以 4
+        guard_size_gb = 23
+        tensor_size = int(guard_size_gb * (1024 ** 3) / 4)
+
+        try:
+            # 生成占位张量，瞬间吃掉 23GB
+            guard_tensor = torch.empty(tensor_size, dtype=torch.float32, device=DEVICE)
+
+            # 立刻删除该张量变量
+            del guard_tensor
+
+            # 绝对不要写 torch.cuda.empty_cache()！
+            # 此时这 23GB 已经成为你当前 Python 进程的专属私有缓存，
+            # 等到训练阶段需要 25GB 时，PyTorch 会直接从这里面拿，而不会 OOM。
+            print(f"      ✅ Successfully reserved {guard_size_gb}GB of VRAM!")
+        except Exception as e:
+            print(f"      ⚠️ VRAM Guard failed: Not enough free memory right now. {e}")
+
     # 打印配置表
     print_box("EXPERIMENTAL INFORMATION", [
         f"Info: Structure={args.structure_name} | Model={args.model} | Data Root={args.data_root}",
@@ -219,7 +243,7 @@ def main():
                 f"   🏆 [全能王诞生！] New Best Model Saved! Client {best_client_idx} hit the historical peak: {best_acc:.2f}%")
 
         # 清理显存
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()
 
     # =================================================
     # [Step 5] 最终测试 & 数据保存 (Final Test & Save)

@@ -53,7 +53,7 @@ class DistillClient:
         mean_class_logits = {lbl: class_logits_sum[lbl] / class_counts[lbl] for lbl in class_logits_sum}
         # 【极其重要】：计算完毕后，把模型踢回 CPU，并清空 CUDA 缓存，把显存让给下一个客户端！
         model.cpu()
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()
 
         return mean_class_logits, class_counts
 
@@ -120,6 +120,6 @@ class DistillClient:
             epoch_loss.append(sum(batch_loss_list) / len(batch_loss_list))
 
         local_model.cpu()
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()
 
         return local_model.state_dict(), sum(epoch_loss) / len(epoch_loss)
