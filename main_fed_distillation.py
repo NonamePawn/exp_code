@@ -43,6 +43,7 @@ def main():
     parser.add_argument('--local_epochs', type=int, default=3, help='本地训练轮次')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch Size')
     parser.add_argument('--learning_rate', type=float, default=0.01, help='学习率')
+    parser.add_argument('--dirichlet_alpha', type=float, default=0.1, help='狄利克雷参数')
 
     # [蒸馏核心参数]
     parser.add_argument('--kd_alpha', type=float, default=0.3, help='蒸馏权重 (0.3表示30%看老师, 70%看自己)')
@@ -89,7 +90,7 @@ def main():
         f"Info: Structure={args.structure_name} | Model={args.model} | Data Root={args.data_root}",
         f"Settings: Batch Size={args.batch_size} | Learning Rate={args.learning_rate} | Device={DEVICE}",
         f"Federated Params: Clients={args.num_clients} | Rounds={args.rounds} | Local Epochs={args.local_epochs}",
-        f"Distill Params:  Alpha={args.kd_alpha} | Temp={args.kd_temp}",
+        f"Distill Params: Distill Alpha={args.kd_alpha} | Temp={args.kd_temp} | Dirichlet Alpha = {args.dirichlet_alpha}",
         hw_info
     ])
 
@@ -109,7 +110,9 @@ def main():
 
     # 1. 训练数据 (Client)
     train_partitioner = FederatedPartitioner(data_root=train_path, num_clients=args.num_clients)
-    private_data_map = train_partitioner.split_iid()
+    # 🌟 把原本写死的 0.1 替换为 args.dirichlet_alpha
+    print(f"   📊 [Non-IID] Applying Dirichlet distribution (alpha={args.dirichlet_alpha}) for data partitioning...")
+    private_data_map = train_partitioner.split_non_iid_dirichlet(alpha=args.dirichlet_alpha)
     total_private_samples = len(train_partitioner.data_indices)
 
     # 2. 验证与测试数据 (Server)
@@ -136,13 +139,17 @@ def main():
     print(f"\n[2/5] 🤖 Initializing Models...")
     global_model = get_model(args.model, num_classes=num_classes)
 
-    # 【修复点 1】：先在 CPU 上复制 10 份，绝对不要在 GPU 上复制！
-    local_models = [copy.deepcopy(global_model) for _ in range(args.num_clients)]
+    # 🌟 核心：只在 CPU 里维护轻量级的参数字典，而不是整个模型实例
+    local_weights = [{k: v.cpu().clone() for k, v in global_model.state_dict().items()} for _ in
+                     range(args.num_clients)]
 
-    # 复制完之后，再把服务端模型放上 GPU
+    # 全局模型长期驻留 GPU，作为服务端的验证模型
     global_model.to(DEVICE)
-
     server = Server(global_model, val_loader, DEVICE)
+
+    # 创建一个同样长期驻留 GPU 的“客户端打工模型”
+    worker_model = get_model(args.model, num_classes=num_classes)
+    worker_model.to(DEVICE)
 
     clients = []
     print(f"   -> Creating {args.num_clients} Clients with ONLY Private Data...")
@@ -170,11 +177,12 @@ def main():
         print("   📡 Extracting Class-wise Logits from clients' private data...")
         all_class_logits = {}
         all_class_counts = {}
-        # 【修复点 2】：加上最外层的 TQDM 进度条
         with tqdm(total=args.num_clients, desc="   🔍 Extracting", ncols=100, colour='yellow') as pbar:
             for i, client in enumerate(clients):
-                # 此时提取特征，客户端内部会把自己的 local_models[i] 放上 GPU，算完再拿下来
-                c_logits, c_counts = client.get_local_class_logits(local_models[i])
+                # 🌟 让 GPU 上的打工模型加载当前客户端的权重
+                worker_model.load_state_dict(local_weights[i])
+
+                c_logits, c_counts = client.get_local_class_logits(worker_model)
                 all_class_logits[i] = c_logits
                 all_class_counts[i] = c_counts
                 pbar.update(1)
@@ -184,22 +192,24 @@ def main():
         exclusive_class_logits_dict = server.compute_exclusive_class_logits(all_class_logits, all_class_counts)
 
         # --- 阶段 3: 客户端在本地私有数据上协同演进 ---
-        local_weights = []
         local_losses = []
         with tqdm(total=args.num_clients, desc="   ⚗️Distilling", ncols=100, colour='cyan') as pbar:
             for i, client in enumerate(clients):
-                w, loss = client.train_odcm_no_public(
-                    local_model=local_models[i],
+                # 🌟 让 GPU 上的打工模型加载当前客户端的权重
+                worker_model.load_state_dict(local_weights[i])
+
+                w_cpu, loss = client.train_odcm_no_public(
+                    local_model=worker_model,
                     exclusive_class_logits=exclusive_class_logits_dict[i],
                     epochs=args.local_epochs,
                     lr=args.learning_rate,
                     alpha=args.kd_alpha,
                     temperature=args.kd_temp
                 )
-                local_weights.append(w)
-                local_losses.append(loss)
-                local_models[i].load_state_dict(w)  # 本地模型自我保留
 
+                # 🌟 把更新后的 CPU 权重存回列表
+                local_weights[i] = w_cpu
+                local_losses.append(loss)
                 pbar.set_postfix({"Loss": f"{loss:.3f}"})
                 pbar.update(1)
 
@@ -242,6 +252,13 @@ def main():
             print(
                 f"   🏆 [全能王诞生！] New Best Model Saved! Client {best_client_idx} hit the historical peak: {best_acc:.2f}%")
 
+        # 查看当前瞬间的真实显存占用 (GB)
+        current_vram = torch.cuda.memory_allocated() / (1024 ** 3)
+
+        # 查看从程序启动到现在的历史显存峰值 (GB) —— 这个最重要，它决定了你到底会不会 OOM！
+        max_vram = torch.cuda.max_memory_allocated() / (1024 ** 3)
+
+        print(f"📊 真实显存: 当前 {current_vram:.2f} GB | 峰值 {max_vram:.2f} GB")
         # 清理显存
         # torch.cuda.empty_cache()
 

@@ -31,6 +31,17 @@ class RadImageNetExtractor(nn.Module):
         # 剥离最后两层，保留空间特征图
         self.cnn = nn.Sequential(*list(self.cnn.children())[:-2])
 
+        # ==========================================
+        # ❄️ 新增：冻结 ResNet50 底层与前 2 个 Stage
+        # ==========================================
+        # ResNet50 的结构包含：conv1, bn1, layer1(Stage1), layer2(Stage2), layer3, layer4
+        frozen_layers = ['conv1', 'bn1', 'layer1', 'layer2']
+        for name, param in self.cnn.named_parameters():
+            # 如果参数的名字里包含上述任何一个字符串，就冻结它
+            if any(fl in name for fl in frozen_layers):
+                param.requires_grad = False
+        print("❄️ RadImageNet: 已冻结浅层特征提取器 (conv1, bn1, layer1, layer2)")
+
     def forward(self, x_multi):
         # x_multi: (B, 5, 512, 512) -> adapter -> (B, 3, 512, 512) -> cnn -> (B, 2048, 16, 16)
         x_3c = self.adapter(x_multi)
@@ -64,6 +75,30 @@ class RadDINOExtractor(nn.Module):
             print(f"请检查本地文件夹 '{pretrained_path}' 中是否完整包含必须的模型文件。")
             print(f"通常需要: config.json 和 pytorch_model.bin (或 model.safetensors)")
             raise e
+
+        # ==========================================
+        # ❄️ 新增：冻结 DINOv2 的 Patch Embeddings 和前 6 个 Block
+        # ==========================================
+        freeze_blocks = 6  # 设定冻结前 6 层 (可以根据显存情况改为 8)
+
+        for name, param in self.vit.named_parameters():
+            # 1. 冻结最底层的 Patch Embedding 层
+            if 'embeddings' in name:
+                param.requires_grad = False
+
+            # 2. 冻结前 N 个 Transformer Encoder Block
+            elif 'encoder.layer' in name:
+                try:
+                    # HuggingFace 的命名规范通常是 "encoder.layer.0.attention..."
+                    # 我们把 ".0." 这个数字提取出来判断
+                    layer_num = int(name.split('encoder.layer.')[1].split('.')[0])
+                    if layer_num < freeze_blocks:
+                        param.requires_grad = False
+                except ValueError:
+                    pass  # 万一命名规则不符，跳过以免报错
+
+        print(f"❄️ RadDINO: 已冻结 Patch Embeddings 与前 {freeze_blocks} 个 Transformer Block")
+
 
     def forward(self, x_multi):
         # x_multi: (B, 5, 512, 512) -> 插值 -> (B, 5, 518, 518) -> adapter -> (B, 3, 518, 518)
