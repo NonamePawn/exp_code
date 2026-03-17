@@ -94,7 +94,7 @@ def get_dataloader(data_list, batch_size=32, is_train=True):
         dataset,
         batch_size=batch_size,
         shuffle=is_train,
-        num_workers=16,  # 多线程加速
+        num_workers=8,  # 多线程加速
         pin_memory=True,
         drop_last=is_train
     )

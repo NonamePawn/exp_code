@@ -36,7 +36,7 @@ class Server:
 
         with torch.no_grad():
             # 🌟 优化1：加上蓝色的测试专属进度条
-            val_pbar = tqdm(self.val_loader, desc="   📊 Server Evaluating", leave=False, ncols=80, colour='blue')
+            val_pbar = tqdm(self.val_loader, desc="   📊 Server Evaluating", leave=False, ncols=120, colour='blue')
 
             for images, labels in val_pbar:
                 images, labels = images.to(self.device), labels.to(self.device)
@@ -142,9 +142,9 @@ class Server:
 
                 # 🌟 优化：开启混合精度加速特征提取
                 with torch.cuda.amp.autocast():
-                    output = self.global_model(images)
+                    # ======== 仅修改这一行：增加 return_features=True ========
+                    output = self.global_model(images, return_features=True)
 
-                features = None
                 # 判断模型是否返回了特征
                 if isinstance(output, tuple):
                     logits = output[0]

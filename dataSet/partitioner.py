@@ -47,8 +47,7 @@ class FederatedPartitioner:
                     "class_name": d_dir.name
                 })
 
-        print(
-            f"[Partitioner] Indexed {len(samples)} samples from {len(self.class_map)} classes: {self.class_map.keys()}")
+        # print(f"[Partitioner] Indexed {len(samples)} samples from {len(self.class_map)} classes: {self.class_map.keys()}")
         return samples
 
     def get_all_data(self) -> List[Dict]:

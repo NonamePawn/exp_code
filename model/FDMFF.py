@@ -25,7 +25,7 @@ class FDMFF(nn.Module):
                          use_radimagenet=use_radimagenet,
                          use_raddino=use_raddino)
 
-    def forward(self, x):
+    def forward(self, x, return_features=False):
         """
         全流程数据流转
         输入:
@@ -43,7 +43,10 @@ class FDMFF(nn.Module):
         local_feat, global_feat = self.dhfem(x_multi)
 
         # 步骤 3: 维度对齐、交叉融合与溯源分类
-        # logits: (B, num_classes)
-        logits = self.dffm(local_feat, global_feat)
-
-        return logits
+        # ======== 修改部分 ========
+        if return_features:
+            logits, features = self.dffm(local_feat, global_feat, return_features=True)
+            return logits, features
+        else:
+            logits = self.dffm(local_feat, global_feat)
+            return logits

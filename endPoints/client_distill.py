@@ -14,7 +14,8 @@ class DistillClient:
                                          batch_size=batch_size,
                                          shuffle=True,
                                          num_workers=8,      # 根据你的 CPU 核心数调整，Linux推荐8，Windows推荐4
-                                         pin_memory=True     # 加速数据向 GPU 显存的拷贝
+                                         pin_memory=True,     # 加速数据向 GPU 显存的拷贝
+                                         drop_last=True,
                                         )
 
         self.criterion_ce = nn.CrossEntropyLoss()

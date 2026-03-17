@@ -48,7 +48,7 @@ class DFFM(nn.Module):
             nn.Linear(512, num_classes)
         )
 
-    def forward(self, local_feat, global_feat):
+    def forward(self, local_feat, global_feat, return_features=False):
         # 1. 双分支融合逻辑
         if self.use_radimagenet and self.use_raddino:
             # 空间上采样对齐: 16x16 -> 37x37
@@ -80,4 +80,8 @@ class DFFM(nn.Module):
 
         # 分类输出
         logits = self.classifier(final_vector)
+
+        # ======== 新增部分 ========
+        if return_features:
+            return logits, final_vector
         return logits
