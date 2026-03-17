@@ -16,6 +16,7 @@ class DistillClient:
                                          num_workers=8,      # 根据你的 CPU 核心数调整，Linux推荐8，Windows推荐4
                                          pin_memory=True,     # 加速数据向 GPU 显存的拷贝
                                          drop_last=True,
+                                         prefetch_factor=4
                                         )
 
         self.criterion_ce = nn.CrossEntropyLoss()
@@ -72,7 +73,7 @@ class DistillClient:
         # ==========================================
         # 🌟 修改 2: 设置梯度累加步数与混合精度
         # ==========================================
-        accumulation_steps = 4  # 攒够 4 个小 batch 才更新一次权重
+        accumulation_steps = 2  # 攒够 4 个小 batch 才更新一次权重
         scaler = torch.cuda.amp.GradScaler()
 
         for epoch in range(epochs):
