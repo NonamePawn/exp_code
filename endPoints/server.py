@@ -177,3 +177,31 @@ class Server:
         # torch.cuda.empty_cache()
 
         return features, labels, preds, logits
+
+    def predict_openset(self, logits, threshold_delta=0.8):
+        """
+        4.2.3 动态拒识判定准则 (对应公式 4-9)
+        :param logits: 模型输出 [Batch, K+1]
+        :param threshold_delta: 拒识博弈阈值 δ (据你论文图4-7，0.8为最优平衡点)
+        :return: 最终预测类别张量 (-1 代表未知类)
+        """
+        # 转化为概率分布
+        probs = F.softmax(logits, dim=1)
+
+        # 提取已知类 (前 K 维) 的最大概率
+        known_probs = probs[:, :-1]
+        max_known_probs, _ = torch.max(known_probs, dim=1)
+
+        # 提取第 K+1 维 (未知类) 的概率
+        unknown_probs = probs[:, -1]
+
+        # 核心判定：如果未知类概率 >= δ * 已知类最大概率，则触发拒识拦截
+        is_unknown = unknown_probs >= (threshold_delta * max_known_probs)
+
+        # 获取基础的已知类预测
+        final_preds = torch.argmax(known_probs, dim=1)
+
+        # 将被拦截的样本类别标记为 -1 (代表 Open-set Unknown)
+        final_preds[is_unknown] = -1
+
+        return final_preds

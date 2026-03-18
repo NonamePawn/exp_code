@@ -34,6 +34,43 @@ def print_box(title, content_lines):
     print(f"╚{'═' * width}╝")
 
 
+# =========================================================
+# 🌟 [4.2.4 新增] 联邦投票开集协同策略：全局投票共识生成
+# =========================================================
+def compute_fv_ocs_consensus(all_class_logits, all_class_counts, current_tau):
+    """
+    根据论文公式 (4-10) 和 (4-11) 计算加权全局共识 P_vote
+    """
+    global_consensus_probs = {}
+    class_client_weights = {}
+
+    # 1. 收集各局部模型在对应类别的特征响应 (Logits)
+    for client_id, c_logits in all_class_logits.items():
+        for c_id, logits in c_logits.items():
+            if c_id not in global_consensus_probs:
+                global_consensus_probs[c_id] = []
+                class_client_weights[c_id] = []
+
+            # 公式 4-10：应用动态温度 τ(t) 进行概率软化
+            soft_prob = torch.nn.functional.softmax(logits / current_tau, dim=0)
+            global_consensus_probs[c_id].append(soft_prob)
+
+            # 记录该中心的历史协同贡献度 (以样本量表征可靠性权重 γ_m)
+            class_client_weights[c_id].append(all_class_counts[client_id][c_id])
+
+    # 2. 加权投票生成全局共识 P_vote
+    final_consensus = {}
+    for c_id in global_consensus_probs.keys():
+        probs_stack = torch.stack(global_consensus_probs[c_id])  # [参与该类别的中心数, K+1]
+        weights = torch.tensor(class_client_weights[c_id], dtype=torch.float32)
+        weights = weights / weights.sum()  # 归一化 γ_m 满足 \sum γ_m = 1
+
+        # 公式 4-11：加权求和 P_vote = \sum γ_m * p_m
+        voted_prob = torch.sum(probs_stack * weights.unsqueeze(1), dim=0)
+        final_consensus[c_id] = voted_prob
+
+    return final_consensus
+
 def main():
     # =================================================
     # [Step 1] 参数配置 (Configuration)
@@ -59,7 +96,7 @@ def main():
     # 第三章保留的蒸馏核心参数：温度与权重
     parser.add_argument('--kd_alpha', type=float, default=0.3,
                         help='知识蒸馏所占的 Loss 权重 (0.3代表蒸馏占30%，CE占70%)')
-    parser.add_argument('--kd_temp', type=float, default=4.0, help='Softmax 的缩放温度，温度越高，输出的概率分布越平滑')
+    parser.add_argument('--kd_temp', type=float, default=4.0, help='蒸馏的软化温度(Temperature)，建议值 4.0')
 
     # 第四章新增的双轨核心参数：极化阈值与扰动步长
     parser.add_argument('--adv_threshold', type=float, default=0.7,
@@ -104,7 +141,7 @@ def main():
         f"Info: Structure={args.structure_name} | Model={args.model} | Data Root={args.data_root}",
         f"Settings: Batch Size={args.batch_size} | Learning Rate={args.learning_rate} | Device={DEVICE}",
         f"Federated: Clients={args.num_clients} | Rounds={args.rounds} | Alpha = {args.dirichlet_alpha}",
-        f"Open-Set Params: Adv Threshold={args.adv_threshold * 100}% | Epsilon={args.adv_epsilon}",
+        f"Open-Set Params: Adv Threshold={args.adv_threshold * 100}% | Eps Range={args.adv_epsilon_range}",  # <--- 修改这行
         hw_info
     ])
 
@@ -198,113 +235,108 @@ def main():
         clients.append(c)
 
     # =================================================
-    # [Step 4] 开集联合蒸馏演进 (DNOSM Loop)
+    # [Step 4] 开集联合蒸馏演进 (DNOSM + FV-OCS Loop)
     # =================================================
     print(f"\n[3/5] 🚀 Starting Open-Set Federated Distillation Loop")
     global_best_acc = 0.0  # 全局最高精度记录变量
-    clients_best_acc = [0.0] * args.num_clients  # 列表：记录每个客户端自己跑出的历史最佳精度
-    best_model_path = logger.save_dir / "best_model.pth"  # 定义全局全能王模型的保存路径
-    start_time_total = time.time()  # 记录大循环启动的总系统时间
+    clients_best_acc = [0.0] * args.num_clients  # 记录每个客户端自己跑出的历史最佳精度
+    best_model_path = logger.save_dir / "best_model.pth"
+    start_time_total = time.time()
 
-    for round_idx in range(1, args.rounds + 1):  # 联邦通信轮次的外层大循环
-        round_start = time.time()  # 记录当前这一轮的起始时间
-        print(f"\n🔰 Round {round_idx} / {args.rounds}")
+    # 🌟 [4.2.4 新增] 动态温度参数配置
+    initial_tau = args.kd_temp  # 初始温度 (如 4.0)
+    min_tau = 1.0  # 最低温度阈值
+    decay_rate = 0.95  # 温度衰减率
 
-        # --- 阶段 1: 提取各中心类原型 (在线蒸馏的第一步) ---
+    for round_idx in range(1, args.rounds + 1):
+        round_start = time.time()
+
+        # 🌟 公式 4-10：计算随通信轮次衰减的动态温度 τ(t)
+        current_tau = max(min_tau, initial_tau * (decay_rate ** (round_idx - 1)))
+        print(f"\n🔰 Round {round_idx} / {args.rounds} [🌡️ Dynamic Temp τ(t): {current_tau:.3f}]")
+
+        # --- 阶段 1: 提取各中心类原型 ---
         print("   📡 Extracting Class-wise Logits from clients' private data...")
-        all_class_logits = {}  # 保存所有客户端类原型的超级字典
-        all_class_counts = {}  # 保存各类别样本数的超级字典
-
+        all_class_logits = {}
+        all_class_counts = {}
         with tqdm(total=args.num_clients, desc="   🔍 Extracting", ncols=100, colour='yellow') as pbar:
             for i, client in enumerate(clients):
-                # 将内存中的客户端 i 权重拷贝到 GPU 的 worker_model 里
                 worker_model.load_state_dict(local_weights[i])
-
-                # 调用客户端接口，提取它本地数据的类原型特征
                 c_logits, c_counts = client.get_local_class_logits(worker_model)
                 all_class_logits[i] = c_logits
                 all_class_counts[i] = c_counts
-                pbar.update(1)  # 更新进度条
+                pbar.update(1)
 
-        # --- 阶段 2: 服务端排他性聚合 ---
-        # 服务端根据收到的所有类原型，为每个客户端定制“不包含它自身偏差”的全局虚拟教师特征
-        exclusive_class_logits_dict = server.compute_exclusive_class_logits(all_class_logits, all_class_counts)
+        # --- 阶段 2: 服务端 FV-OCS 全局投票共识生成 ---
+        # 传入当前动态温度，生成加权的全局共识 P_vote
+        global_consensus_dict = compute_fv_ocs_consensus(all_class_logits, all_class_counts, current_tau)
 
-        # --- 阶段 3: 客户端在本地私有数据上双轨演进 (最核心的训练突变点) ---
-        local_losses = []  # 记录本轮所有客户端训练返回的 Loss
-        with tqdm(total=args.num_clients, desc="   ⚗️Distilling & Synthesizing", ncols=110, colour='cyan') as pbar:
+        # --- 阶段 3: 客户端在本地私有数据上进行两阶段解耦训练 ---
+        local_losses = []
+        with tqdm(total=args.num_clients, desc="   ⚗️Distilling & Fine-Tuning", ncols=110, colour='cyan') as pbar:
             for i, client in enumerate(clients):
-                # 依然是将属于客户端 i 的权重装载到 GPU
                 worker_model.load_state_dict(local_weights[i])
 
-                # 调用大论文第四章专用的双轨训练接口 (含极化检测、MixUp/FGSM、以及KD Loss)
+                # 传入 FV-OCS 共识字典和动态参数，执行双轨生成与两阶段微调
                 w_cpu, loss = client.train_openset_model(
                     local_model=worker_model,
-                    exclusive_class_logits=exclusive_class_logits_dict[i],
+                    global_consensus=global_consensus_dict,  # 🌟 传入 P_vote 投票共识
                     epochs=args.local_epochs,
                     lr=args.learning_rate,
                     kd_alpha=args.kd_alpha,
-                    temperature=args.kd_temp,
+                    temperature=current_tau,  # 🌟 传入当前的动态温度
                     num_known_classes=num_classes,
-                    epsilon_range=tuple(args.adv_epsilon_range)  # <--- 新增这一行：将列表转为元组传进去
+                    epsilon_range=tuple(args.adv_epsilon_range)  # 🌟 传入实例级动态扰动步长范围
                 )
 
-                local_weights[i] = w_cpu  # 训练完成，将更新后的字典直接覆盖本地内存的旧字典
+                local_weights[i] = w_cpu
                 local_losses.append(loss)
-                pbar.set_postfix({"Loss": f"{loss:.3f}"})  # 进度条显示当前的 loss
+                pbar.set_postfix({"Loss": f"{loss:.3f}"})
                 pbar.update(1)
 
-        # --- 阶段 4: 服务端验证聚合 (纯联邦验证，不使用传统的 FedAvg 权重相加) ---
+        # --- 阶段 4: 服务端验证聚合 (纯联邦验证) ---
         val_acc_list = []
         val_loss_list = []
 
-        # 联邦蒸馏特有的评估模式：我们不直接平均参数，而是依次评估每个客户端进化后的个性化模型
+        # 依次评估每个客户端进化后的个性化模型
         for i in range(args.num_clients):
-            # 将客户端 i 训练好的权重赋予服务端的全局模型，去跑验证集
             server.global_model.load_state_dict(local_weights[i])
             c_acc, c_loss = server.evaluate()
-            val_acc_list.append(c_acc)  # 记录下第 i 个客户端在公共验证集上的得分
+            val_acc_list.append(c_acc)
             val_loss_list.append(c_loss)
 
-        # 计算所有客户端模型的平均表现，以此作为整个系统演进效果的最终衡量标准
         val_acc = sum(val_acc_list) / len(val_acc_list)
         val_loss = sum(val_loss_list) / len(val_loss_list)
 
-        # 时间统计
         round_time = time.time() - round_start
         round_time_min = round_time / 60
         print(f" Round {round_idx} Total Time: {round_time_min:.2f}min")
 
-        # 将本轮的关键指标打入日志（同时也会被存入 log 文本以备画图）
+        # 记录指标
         logger.log_metrics(round_idx, sum(local_losses) / len(local_losses), 0, val_loss, val_acc, 0, round_time)
 
         # ==========================================
         # 🌟 全能王模型保存策略
         # ==========================================
-        # 在这 N 个个性化模型中，找出本轮在验证集上得分最高的那一个 (全能王)
         current_max_acc = max(val_acc_list)
         best_client_idx = val_acc_list.index(current_max_acc)
 
         print(
             f"   📈 Round {round_idx} Max Acc: {current_max_acc:.2f}% (from Client {best_client_idx}) | Avg Acc: {val_acc:.2f}%")
 
-        # 如果这个全能王的成绩突破了有史以来的记录
         if current_max_acc > global_best_acc:
-            global_best_acc = current_max_acc  # 更新最高记录
-            # 将这份最优秀的模型权重保存到硬盘上
+            global_best_acc = current_max_acc
             torch.save(local_weights[best_client_idx], best_model_path)
             print(
                 f"   🏆 [全能王诞生！] New Best Open-Set Model Saved! Client {best_client_idx} hit peak: {global_best_acc:.2f}%")
 
-        # 同时也监控每个客户端是否打破了它自己局部的历史记录，用于最后的消融实验对比
+        # 监控每个客户端是否打破局部历史记录
         for i in range(args.num_clients):
             if val_acc_list[i] > clients_best_acc[i]:
                 clients_best_acc[i] = val_acc_list[i]
-                # 记录为 best_client_0.pth, best_client_1.pth ...
                 client_model_path = logger.save_dir / f"best_client_{i}.pth"
                 torch.save(local_weights[i], client_model_path)
 
-        # 查看当前的物理显存运行状况，确保没有发生内存泄漏
         current_vram = torch.cuda.memory_allocated() / (1024 ** 3)
         max_vram = torch.cuda.max_memory_allocated() / (1024 ** 3)
         print(f"📊 真实显存: 当前 {current_vram:.2f} GB | 峰值 {max_vram:.2f} GB")

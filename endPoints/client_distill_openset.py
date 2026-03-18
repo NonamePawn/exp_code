@@ -1,317 +1,258 @@
 # 文件名: endPoints/client_distill_openset.py
-import torch  # 导入PyTorch核心库
-import torch.nn as nn  # 导入神经网络模块
-import torch.nn.functional as F  # 导入常用的函数接口，如激活函数、独热编码、损失函数等
-from torch.utils.data import DataLoader  # 导入数据加载器，用于批量提取数据
-from tqdm import tqdm  # 导入进度条工具，方便在终端实时观察训练进度
-import numpy as np  # 导入NumPy，用于生成MixUp所需的Beta分布随机数
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+import numpy as np
+
+# 🌟 引入上一轮我们编写的连续软标签对比损失函数
+from utils.loss_openset import SoftLabelSupConLoss
 
 
 class OpenSetDistillClient:
-    """
-    联邦开集双轨客户端类。
-    负责本地数据的极化浓度检测，并在 MixUp 轨道和 FGSM 对抗轨道之间智能切换，
-    同时兼容第三章的在线知识蒸馏（ODCM）逻辑。
-    """
-
     def __init__(self, client_id, private_dataset, device, batch_size, adv_threshold=0.75):
-        self.client_id = client_id  # 当前客户端的唯一标识符（ID）
-        self.device = device  # 训练设备，通常是 'cuda' (如你的 A6000 显卡)
-        self.batch_size = batch_size  # 每次送入网络的图像批次大小
-        self.adv_threshold = adv_threshold  # 极化阈值：某类数据占比超过此值即触发对抗轨道
+        self.client_id = client_id
+        self.device = device
+        self.batch_size = batch_size
+        self.adv_threshold = adv_threshold
 
-        # 初始化私有数据加载器，配置多线程和显存固定以加速训练
         self.private_loader = DataLoader(
-            private_dataset,  # 客户端本地分配到的非独立同分布 (Non-IID) 数据集
-            batch_size=batch_size,  # 按照预设的 Batch Size 划分
-            shuffle=True,  # 开启打乱，保证每个 Epoch 网络看到的样本顺序不同
-            num_workers=8,  # 开启8个CPU线程去读取硬盘数据，防止GPU等待
-            pin_memory=True  # 将数据直接锁在主机的锁页内存中，加速向GPU显存的拷贝
+            private_dataset, batch_size=batch_size, shuffle=True,
+            num_workers=8, pin_memory=True
         )
 
-        # 实例化交叉熵损失函数，用于分类任务（原生支持软标签，无需额外设置）
         self.criterion_ce = nn.CrossEntropyLoss()
-        # 实例化KL散度损失函数，用于知识蒸馏任务，'batchmean' 表示在 Batch 维度上求平均
         self.criterion_kl = nn.KLDivLoss(reduction='batchmean')
+        self.criterion_supcon = SoftLabelSupConLoss(temperature=0.07)  # 🌟 4.2.2 专用损失
 
     def get_local_class_logits(self, model):
-        """
-        提取本地私有数据上各个设备类别的平均特征响应 (Logits)。
-        这是第三章联邦蒸馏提取“类原型”的核心函数。
-        """
-        model.eval()  # 将模型切换到评估模式，关闭 Dropout 和 BatchNorm 的随机性
-        # model.to(self.device)  # 将服务端下发的全局模型搬运到当前 GPU 显存上
-
-        class_logits_sum = {}  # 字典：用于累加每个类别的输出 Logits
-        class_counts = {}  # 字典：用于记录每个类别的样本数量，方便求平均
-
-        with torch.no_grad():  # 关闭梯度计算引擎，大幅节省显存并加速前向传播
-            # 遍历本地 DataLoader，附带 tqdm 进度条
+        """提取本地 K+1 维类原型"""
+        model.eval()
+        class_logits_sum = {}
+        class_counts = {}
+        with torch.no_grad():
             for imgs, labels in tqdm(self.private_loader, desc=f"Client {self.client_id}", leave=False, ncols=80):
-                imgs = imgs.to(self.device)  # 将当前 Batch 的 CT 图像搬运到 GPU (维度: [B, 1, 512, 512])
-
-                with torch.cuda.amp.autocast():  # 开启自动混合精度计算 (FP16/FP32 智能切换)
-                    out = model(imgs)  # 获得网络输出 (维度: [B, K+1])
-                    if isinstance(out, tuple): out = out[0]  # 如果网络返回多项内容，只取第一项 Logits
-
-                # 遍历当前 Batch 中的每一张图的预测结果和真实标签
+                imgs = imgs.to(self.device)
+                with torch.cuda.amp.autocast():
+                    out = model(imgs)
+                    if isinstance(out, tuple): out = out[0]
                 for i, label in enumerate(labels):
-                    lbl = label.item()  # 取出当前图片的真实类别索引（标量）
+                    lbl = label.item()
                     if lbl not in class_logits_sum:
-                        # 如果该类别是第一次出现，克隆结果并放回 CPU (防止积攒在 GPU 导致显存爆炸)
                         class_logits_sum[lbl] = out[i].clone().cpu()
-                        class_counts[lbl] = 1  # 计数初始化为 1
+                        class_counts[lbl] = 1
                     else:
-                        # 如果类别已存在，累加 Logits 向量，并计数 +1
                         class_logits_sum[lbl] += out[i].cpu()
                         class_counts[lbl] += 1
-
-        # 通过字典推导式，用总和除以总数，算出每个类别的平均特征响应（类原型）
         mean_class_logits = {lbl: class_logits_sum[lbl] / class_counts[lbl] for lbl in class_logits_sum}
-        # model.cpu()  # 【极其重要】计算完毕后，立刻将模型踢出 GPU 显存，留出空间给接下来的训练
-        return mean_class_logits, class_counts  # 返回局部类原型字典和数量字典
+        return mean_class_logits, class_counts
 
     def _check_track_condition(self):
-        """
-        动态路由机制：扫描本地数据集，统计类别分布浓度，决定走 MixUp 还是 对抗轨道。
-        """
-        label_counts = {}  # 字典：记录本地拥有的各类别样本总数
-        total_samples = 0  # 变量：记录本地总样本数
-
-        # 快速遍历本地 DataLoader（不涉及模型，速度极快）
+        label_counts = {}
+        total_samples = 0
         for _, labels in self.private_loader:
-            for lbl in labels:  # 遍历每个标签
-                l = lbl.item()  # 转换为 Python 标量
-                # 在字典中累计该类别的数量，如果没有则默认为 0 再加 1
+            for lbl in labels:
+                l = lbl.item()
                 label_counts[l] = label_counts.get(l, 0) + 1
-                total_samples += 1  # 总数加 1
-
-        # 找出数据集中占比最大的那一个类别的具体比例
+                total_samples += 1
         max_ratio = max(label_counts.values()) / total_samples
-
-        # 如果最大类别的占比 >= 设定的阈值 (如 75%)
         if max_ratio >= self.adv_threshold:
-            # 说明数据极度倾斜（单一设备孤岛），触发对抗生成轨道
             return "Adversarial_Track", max_ratio
         else:
-            # 否则说明有多个类别可以混合，触发特征 MixUp 轨道
             return "MixUp_Track", max_ratio
 
-    def _compute_kd_loss(self, out_clean, private_labels, exclusive_class_logits, temperature):
+    def _compute_fv_ocs_loss(self, logits_stage2, labels, global_consensus, temperature):
         """
-        知识蒸馏（ODCM）辅助函数：计算当前样本与全局虚拟教师的 KL 散度损失。
+        🌟 [4.2.4 核心] 联邦投票开集协同损失计算 (对应公式 4-12)
         """
-        teacher_logits_list = []  # 列表：用于存放拼装好的教师信号
-        # 遍历当前 Batch 的每一个真实标签
-        for i, lbl in enumerate(private_labels):
-            lbl_idx = lbl.item()  # 提取标量索引
-            # 如果服务端下发了该类别排他性全局类原型
-            if lbl_idx in exclusive_class_logits:
-                # 就把全局类原型作为该样本的教师信号加入列表
-                teacher_logits_list.append(exclusive_class_logits[lbl_idx])
+        target_probs_list = []
+        for i in range(len(labels)):
+            lbl_idx = labels[i].item()
+            if lbl_idx in global_consensus:
+                # 接收来自服务端的投票共识 P_vote
+                target_probs_list.append(global_consensus[lbl_idx].to(self.device))
             else:
-                # 如果没有，则使用当前模型自己生成的 Logits 作为平替（并切断梯度，且搬到 CPU 统一格式）
-                teacher_logits_list.append(out_clean[i].detach().cpu())
+                # 如果没有共识，使用本地平滑概率作为平替
+                target_probs_list.append(F.softmax(logits_stage2[i].detach() / temperature, dim=0))
 
-        # 将列表中的 B 个张量堆叠成一个完整的 Batch 张量，并搬运到 GPU (维度: [B, K+1])
-        teacher_logits = torch.stack(teacher_logits_list).to(self.device)
+        target_probs = torch.stack(target_probs_list)  # [B, K+1]
 
-        # 按照知识蒸馏标准公式：学生输出除以温度T，并取 log_softmax
-        student_log_probs = F.log_softmax(out_clean / temperature, dim=1)
-        with torch.no_grad():
-            # 教师输出除以温度T，并取 softmax (概率化)
-            teacher_probs = F.softmax(teacher_logits / temperature, dim=1)
+        # P_local: 本地网络当前微调输出的概率分布
+        student_log_probs = F.log_softmax(logits_stage2 / temperature, dim=1)
 
-        # 计算 KL 散度损失，并乘以温度平方以保持梯度幅度一致
-        loss_kd = self.criterion_kl(student_log_probs, teacher_probs) * (temperature ** 2)
-        return loss_kd  # 返回蒸馏 Loss
+        # 计算 KL 散度拉近距离
+        loss_fv_ocs = self.criterion_kl(student_log_probs, target_probs) * (temperature ** 2)
+        return loss_fv_ocs
 
-    def train_mixup_track(self, local_model, optimizer, scaler, epochs, exclusive_class_logits,
-                          num_known_classes, kd_alpha, temperature, mix_alpha=0.2):
-        """
-        【轨道 A】特征级 MixUp 平滑轨道 (极度省显存版：分离计算 + 梯度累加)
-        """
+    # =======================================================
+    # [Stage 1 专用轨道]：纯净化特征拓扑重塑 (仅计算 SupCon)
+    # =======================================================
+    def train_mixup_track(self, local_model, optimizer, scaler, epochs, num_known_classes, mix_alpha=0.2):
         epoch_loss = []
         for epoch in range(epochs):
             batch_loss_list = []
-            inner_loader = tqdm(self.private_loader,
-                                desc=f"   [Client {self.client_id} | Ep {epoch + 1}/{epochs} | MixUp]", leave=False,
+            inner_loader = tqdm(self.private_loader, desc=f"   [Client {self.client_id} | MixUp | SupCon]", leave=False,
                                 ncols=100, colour='blue')
-
             for imgs, labels in inner_loader:
                 imgs, labels = imgs.to(self.device), labels.to(self.device)
                 optimizer.zero_grad()
-                total_loss_val = 0.0  # 用于记录合并后的 Loss 值以便打印
 
-                # -------- 第一波：纯净图像前向传播，仅计算知识蒸馏 Loss --------
                 with torch.cuda.amp.autocast():
-                    out_clean = local_model(imgs)
-                    loss_kd = self._compute_kd_loss(out_clean, labels, exclusive_class_logits, temperature)
-                    # 按照 kd_alpha 权重对蒸馏 Loss 进行缩放
-                    loss_kd_weighted = kd_alpha * loss_kd
-
-                # 反向传播，累加蒸馏的梯度
-                # 【关键动作】：这一步反传后，out_clean 产生的庞大计算图会被立刻释放！显存回落。
-                scaler.scale(loss_kd_weighted).backward()
-                total_loss_val += loss_kd_weighted.item()
-
-                # -------- 第二波：截断式前向传播，进行 MixUp 并计算分类 Loss --------
-                with torch.cuda.amp.autocast():
-                    # 1. 提取高频特征
-                    gmpm_features = local_model.forward_gmpm(imgs)
-                    batch_sz = gmpm_features.size(0)
-
-                    # 2. 生成 MixUp 混叠参数
-                    index = torch.randperm(batch_sz).to(self.device)
+                    gmpm_feat = local_model.forward_gmpm(imgs)
+                    batch_sz = gmpm_feat.size(0)
+                    idx = torch.randperm(batch_sz).to(self.device)
                     lam = np.random.beta(mix_alpha, mix_alpha)
 
-                    # 3. 特征空间混叠
-                    mixed_features = lam * gmpm_features + (1 - lam) * gmpm_features[index]
+                    # 特征混叠
+                    mixed_feat = lam * gmpm_feat + (1 - lam) * gmpm_feat[idx]
 
-                    # 4. 标签空间混叠 (K+1维)
-                    labels_onehot = F.one_hot(labels, num_classes=num_known_classes + 1).float()
-                    labels_onehot_idx = F.one_hot(labels[index], num_classes=num_known_classes + 1).float()
-                    mixed_labels = lam * labels_onehot + (1 - lam) * labels_onehot_idx
+                    # 标签混叠 (K+1维连续软标签)
+                    labels_oh = F.one_hot(labels, num_classes=num_known_classes + 1).float()
+                    labels_oh_idx = F.one_hot(labels[idx], num_classes=num_known_classes + 1).float()
+                    mixed_labels = lam * labels_oh + (1 - lam) * labels_oh_idx
 
-                    # 5. 后续网络传播
-                    outputs_mixed = local_model.forward_features(mixed_features)
-                    loss_ce = self.criterion_ce(outputs_mixed, mixed_labels)
+                    # 前向传播至潜空间
+                    fused = local_model.extract_fused_features(mixed_feat)
+                    z_norm = local_model.forward_stage1(fused)
 
-                    # 按照 (1 - kd_alpha) 权重对分类 Loss 进行缩放
-                    loss_ce_weighted = (1 - kd_alpha) * loss_ce
+                    # 🌟 严格只使用 SLCLM 损失，彻底消除显存翻倍与梯度冲突
+                    loss_supcon = self.criterion_supcon(z_norm, mixed_labels)
 
-                # 反向传播，累加 MixUp 的分类梯度
-                scaler.scale(loss_ce_weighted).backward()
-                total_loss_val += loss_ce_weighted.item()
-
-                # -------- 最终：两波梯度累加完毕，更新网络权重 --------
+                scaler.scale(loss_supcon).backward()
                 scaler.step(optimizer)
                 scaler.update()
 
-                batch_loss_list.append(total_loss_val)
-                inner_loader.set_postfix({'loss': f"{total_loss_val:.3f}"})
-
+                batch_loss_list.append(loss_supcon.item())
+                inner_loader.set_postfix({'loss': f"{loss_supcon.item():.3f}"})
             epoch_loss.append(sum(batch_loss_list) / len(batch_loss_list))
         return epoch_loss
 
-    def train_adv_track(self, local_model, optimizer, scaler, epochs, exclusive_class_logits,
-                        num_known_classes, kd_alpha, temperature, epsilon_range=(0.01, 0.05)):
-        """
-        【轨道 B】像素级对抗生成轨道 (最终完美版)
-        包含两大核心优化：
-        1. 实例级动态步长 (Dynamic Epsilon)：覆盖连续的特征偏移光谱，建立厚重拒识缓冲带。
-        2. 分离式梯度累加 (Gradient Accumulation)：防止前向传播显存翻倍，保证 24G/48G 显卡安全运行。
-        """
+    def train_adv_track(self, local_model, optimizer, scaler, epochs, num_known_classes, epsilon_range):
         epoch_loss = []
         for epoch in range(epochs):
             batch_loss_list = []
-            # 设置终端彩色进度条
-            inner_loader = tqdm(self.private_loader,
-                                desc=f"   [Client {self.client_id} | Ep {epoch + 1}/{epochs} | Adv]", leave=False,
+            inner_loader = tqdm(self.private_loader, desc=f"   [Client {self.client_id} | Adv | SupCon]", leave=False,
                                 ncols=100, colour='red')
-
             for imgs, labels in inner_loader:
                 imgs, labels = imgs.to(self.device), labels.to(self.device)
 
-                # =========================================================
-                # 阶段一：在像素空间生成对抗负样本 (FGSM with Dynamic Epsilon)
-                # =========================================================
-                # 1. 开启原图梯度追踪，准备求导
+                # --- 1. FGSM 生成假图 ---
                 imgs.requires_grad = True
-
-                # 2. 关闭混合精度 (autocast) 进行前向传播，防止半精度导致梯度下溢出
-                outputs_clean_for_grad = local_model(imgs)
-
-                # 3. 仅对已知的 K 个类别切片求 Loss，寻找破坏已知类边界的最快方向
-                loss_for_adv = F.cross_entropy(outputs_clean_for_grad[:, :num_known_classes], labels)
-
+                out_clean = local_model(imgs)  # 借用冻结的分类头获取破坏已知类的梯度
+                loss_adv = F.cross_entropy(out_clean[:, :num_known_classes], labels)
                 local_model.zero_grad()
-                loss_for_adv.backward()
+                loss_adv.backward()
 
-                # 🌟【核心突变：实例级动态步长】🌟
-                # 为当前 Batch 中的每一张图像 (size(0))，在 epsilon_range [0.01, 0.05] 范围内
-                # 独立生成一个随机的扰动步长。利用广播机制扩展到 [B, 1, 1, 1] 以便与图像张量相乘。
-                dynamic_epsilons = torch.empty(imgs.size(0), 1, 1, 1, device=self.device).uniform_(*epsilon_range)
-
-                # 4. FGSM 公式生成假图：x_adv = x + ε_dynamic * sign(grad)
-                adv_imgs = imgs + dynamic_epsilons * imgs.grad.sign()
-
-                # 5. 像素值截断至合法范围，并用 detach() 切断庞大的计算图释放显存！
+                dyn_eps = torch.empty(imgs.size(0), 1, 1, 1, device=self.device).uniform_(*epsilon_range)
+                adv_imgs = imgs + dyn_eps * imgs.grad.sign()
                 adv_imgs = torch.clamp(adv_imgs, 0, 1).detach()
                 imgs.requires_grad = False
 
-                # =========================================================
-                # 阶段二：分离计算与梯度累加 (彻底解决拼接导致的 OOM 显存翻倍)
-                # =========================================================
-                optimizer.zero_grad()  # 正式训练前，清空阶段一残留的梯度
-                total_loss_val = 0.0  # 累加器，用于记录标量 Loss 并在进度条打印
+                # --- 2. 特征层面对比学习 ---
+                optimizer.zero_grad()
+                combined_imgs = torch.cat([imgs, adv_imgs], dim=0)
 
-                # -------- 第一波：只送入真实的干净图像 (Batch Size = B) --------
-                with torch.cuda.amp.autocast():
-                    out_clean = local_model(imgs)
-
-                    # 计算在线知识蒸馏 Loss (利用辅助函数)
-                    loss_kd = self._compute_kd_loss(out_clean, labels, exclusive_class_logits, temperature)
-                    # 计算干净图像的常规分类 Loss
-                    loss_ce_clean = self.criterion_ce(out_clean, labels)
-
-                    # 第一波总 Loss (乘以 0.5 是因为我们将数据分成了两波计算，保证总体期望与 concat 一致)
-                    loss_real = ((1 - kd_alpha) * loss_ce_clean + kd_alpha * loss_kd) * 0.5
-
-                # 【显存释放点】：反向传播累加真实图像梯度，同时底层释放 out_clean 的中间激活图
-                scaler.scale(loss_real).backward()
-                total_loss_val += loss_real.item()
-
-                # -------- 第二波：只送入对抗假图像 (Batch Size = B) --------
-                # 给假图打上第 K+1 类 (未知类) 的统一标签，索引即 num_known_classes
-                adv_labels = torch.full((imgs.size(0),), num_known_classes, dtype=torch.long).to(self.device)
+                # 构造包含残余置信度(Gamma)的开集锚点软标签
+                labels_clean = F.one_hot(labels, num_classes=num_known_classes + 1).float()
+                gamma = 0.15
+                labels_adv = torch.zeros_like(labels_clean)
+                labels_adv.scatter_(1, labels.unsqueeze(1), gamma)
+                labels_adv[:, num_known_classes] = 1 - gamma
+                combined_labels = torch.cat([labels_clean, labels_adv], dim=0)
 
                 with torch.cuda.amp.autocast():
-                    out_adv = local_model(adv_imgs)
+                    x_multi = local_model.forward_gmpm(combined_imgs)
+                    fused = local_model.extract_fused_features(x_multi)
+                    z_norm = local_model.forward_stage1(fused)
 
-                    # 假图只算交叉熵 Loss，逼迫网络学会拒识（不需要计算知识蒸馏）
-                    loss_ce_adv = self.criterion_ce(out_adv, adv_labels)
+                    # 🌟 同样，严格只使用 SLCLM 损失
+                    loss_supcon = self.criterion_supcon(z_norm, combined_labels)
 
-                    # 第二波总 Loss (同样乘以 0.5)
-                    loss_fake = ((1 - kd_alpha) * loss_ce_adv) * 0.5
-
-                # 【显存释放点】：反向传播累加假图像梯度
-                scaler.scale(loss_fake).backward()
-                total_loss_val += loss_fake.item()
-
-                # -------- 最终：两波梯度完美累加，执行参数更新 --------
+                scaler.scale(loss_supcon).backward()
                 scaler.step(optimizer)
                 scaler.update()
 
-                # 记录本 Batch 的总 Loss (真实图与假图的平均) 并更新进度条显示
-                batch_loss_list.append(total_loss_val)
-                inner_loader.set_postfix({'loss': f"{total_loss_val:.3f}"})
-
-            # 计算该 Epoch 所有 Batch Loss 的平均值并存入大列表
+                batch_loss_list.append(loss_supcon.item())
+                inner_loader.set_postfix({'loss': f"{loss_supcon.item():.3f}"})
             epoch_loss.append(sum(batch_loss_list) / len(batch_loss_list))
-
         return epoch_loss
 
-    def train_openset_model(self, local_model, exclusive_class_logits, epochs, lr, kd_alpha, temperature,
-                            num_known_classes, epsilon_range):
-        """第四章双轨统一对外接口"""
+    # =======================================================
+    # [主训练接口]：控制两阶段解耦时序
+    # =======================================================
+    def train_openset_model(self, local_model, global_consensus, epochs, lr, kd_alpha, temperature, num_known_classes,
+                            epsilon_range):
         local_model.train()
-        optimizer = torch.optim.Adam(local_model.parameters(), lr=lr, weight_decay=1e-4)
         scaler = torch.cuda.amp.GradScaler()
 
-        track_mode, max_ratio = self._check_track_condition()
+        # 计算两阶段 Epoch 比例 (假设 70% 塑特征，30% 定边界)
+        epochs_stage1 = max(1, int(epochs * 0.7))
+        epochs_stage2 = epochs - epochs_stage1
 
+        # ------------------ STAGE 1: 特征拓扑重塑 ------------------
+        # 冻结分类器，激活主干与投影头
+        for param in local_model.classifier.parameters(): param.requires_grad = False
+        for param in local_model.gmpm.parameters(): param.requires_grad = True
+        for param in local_model.dhfem.parameters(): param.requires_grad = True
+        for param in local_model.dffm.parameters(): param.requires_grad = True
+        for param in local_model.projection_head.parameters(): param.requires_grad = True
+
+        optimizer_stage1 = torch.optim.Adam(filter(lambda p: p.requires_grad, local_model.parameters()), lr=lr,
+                                            weight_decay=1e-4)
+
+        track_mode, _ = self._check_track_condition()
         if track_mode == "Adversarial_Track":
-            epoch_losses = self.train_adv_track(
-                local_model, optimizer, scaler, epochs, exclusive_class_logits,
-                num_known_classes, kd_alpha, temperature, epsilon_range=epsilon_range  # <--- 在这里透传给对抗轨道
-            )
+            loss_stage1 = self.train_adv_track(local_model, optimizer_stage1, scaler, epochs_stage1, num_known_classes,
+                                               epsilon_range)
         else:
-            epoch_losses = self.train_mixup_track(
-                local_model, optimizer, scaler, epochs, exclusive_class_logits,
-                num_known_classes, kd_alpha, temperature
-                # MixUp 轨道不需要 epsilon_range，所以不用传
-            )
+            loss_stage1 = self.train_mixup_track(local_model, optimizer_stage1, scaler, epochs_stage1,
+                                                 num_known_classes)
 
-        avg_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else 0
+        # ------------------ STAGE 2: 决策边界微调 ------------------
+        # 强制冻结主干网络！仅激活线性分类决策头
+        for param in local_model.parameters(): param.requires_grad = False
+        for param in local_model.classifier.parameters(): param.requires_grad = True
+
+        optimizer_stage2 = torch.optim.Adam(local_model.classifier.parameters(), lr=lr * 2, weight_decay=1e-4)
+
+        loss_stage2 = []
+        for epoch in range(epochs_stage2):
+            batch_loss_list = []
+            inner_loader = tqdm(self.private_loader, desc=f"   [Client {self.client_id} | Fine-Tune | ORCDM]",
+                                leave=False, ncols=100, colour='green')
+
+            for imgs, labels in inner_loader:
+                imgs, labels = imgs.to(self.device), labels.to(self.device)
+                optimizer_stage2.zero_grad()
+
+                with torch.cuda.amp.autocast():
+                    # 提取固定特征 (主干冻结，无需梯度图，极大加速并省显存)
+                    with torch.no_grad():
+                        x_multi = local_model.forward_gmpm(imgs)
+                        fused_feat = local_model.extract_fused_features(x_multi)
+
+                    # 计算 K+1 维分类响应
+                    logits_stage2 = local_model.forward_stage2(fused_feat)
+
+                    # 🌟 1. 计算基本的软目标交叉熵
+                    loss_ce = self.criterion_ce(logits_stage2, labels)
+
+                    # 🌟 2. [4.2.4 新增] 计算 FV-OCS 联邦投票开集协同损失
+                    loss_fv = self._compute_fv_ocs_loss(logits_stage2, labels, global_consensus, temperature)
+
+                    # 总损失 (对应论文公式 4-12 后面的 L_total)
+                    total_loss = loss_ce + kd_alpha * loss_fv
+
+                scaler.scale(total_loss).backward()
+                scaler.step(optimizer_stage2)
+                scaler.update()
+
+                batch_loss_list.append(total_loss.item())
+                inner_loader.set_postfix({'loss': f"{total_loss.item():.3f}"})
+
+            loss_stage2.append(sum(batch_loss_list) / len(batch_loss_list))
+
+        avg_loss = (sum(loss_stage1) + sum(loss_stage2)) / (len(loss_stage1) + len(loss_stage2)) if (
+                    loss_stage1 or loss_stage2) else 0
         return local_model.state_dict(), avg_loss
